@@ -132,12 +132,10 @@ batch:
     #   creation-date-column → registration_date
     #   updated-at-column → updated_at
     #   commune-id-column → territory_level_3_id
-    #   total-area-column → area
     #   geometry-column → geom
     # persist-columns: extras only (same name on both destinations).
-    # business-only-persist-columns: KPI columns, dsp-db only (same name on target).
-    # To fill theme_1..theme_4, the source column or subquery alias must already
-    # be named theme_N — the job does not rename extras.
+    # AOI area and theme KPI values are calculated by the KPI migration job
+    # (see kpis below), not read from source columns.
     # Details-panel fields stay in installation-config.json, not in this YAML.
     source-table: "<source_schema>.<source_table>"
     target-table: "dsp.area_of_interest"
@@ -145,15 +143,9 @@ batch:
     creation-date-column: "<source_created_at>"
     updated-at-column: "<source_updated_at>"
     commune-id-column: "<source_territory_level_3_fk>"
-    total-area-column: "<source_area>"
     geometry-column: "<source_geom>"
     where-clause: "1=1"
     persist-columns: []
-    business-only-persist-columns:
-      - "<source_theme_1>"
-      - "<source_theme_2>"
-      - "<source_theme_3>"
-      - "<source_theme_4>"
     layer-name: "area-of-interest"
     srid: "${LAYER_SRS_AREA_OF_INTEREST:4326}"
   # Generic layers: job creates dsp.<table> on geo-target automatically.
@@ -177,6 +169,18 @@ batch:
   #     where-clause: "1=1"
   #     enabled: true
   layers: []
+
+# Theme KPI mappings: generated from installation.kpis in adopter-config.yaml.
+# Each theme links a generic layer (etl.layers[].layer_name) to a KPI slot.
+kpis:
+  theme-count: 0
+  themes: []
+  # Example (filled by ./config.sh):
+  # themes:
+  #   - slot: 1
+  #     layer-name: "consolidated_area"
+  #     unit-of-measurement: "ha"
+  #     label: "Consolidated area"
 
 parallelization:
   jobs:
