@@ -1010,7 +1010,13 @@ def build_migration_kpis(values: dict[str, Any]) -> dict[str, Any]:
                 "label": card.get("label"),
             }
         )
-    return {"theme-count": int(theme_count), "themes": themes}
+    return {
+        "theme-count": int(theme_count),
+        "themes": themes,
+        "area-unit-of-measurement": get(
+            values, "installation", "kpis", "area_of_interest", "unit_of_measurement", default="m²"
+        ),
+    }
 
 
 MAP_VIEW_MODES = ("territorial_bbox", "manual", "planet")
@@ -2652,6 +2658,9 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         migration["execution-jobs"][target] = bool(jobs.get(name, True))
     layer_jobs_enabled = bool(jobs.get("layer_jobs", bool(extra_layers)))
     migration["execution-jobs"]["layer-jobs"] = layer_jobs_enabled
+    migration["execution-jobs"]["kpi-job"] = bool(
+        jobs.get("kpi_job", jobs.get("area_of_interest", True))
+    )
     output = root / "config/Job-Data-Migration/application/application.yaml"
     output.write_text(dump_yaml(migration), encoding="utf-8")
     replace_env(root / ".env", values)
