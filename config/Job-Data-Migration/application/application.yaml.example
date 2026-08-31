@@ -9,9 +9,9 @@ spring:
     web-application-type: "none"
   datasource:
     batch:
-      url: "jdbc:postgresql://dsp-job-migration-db:5432/dsp-job-migration-db"
-      username: "dsp_job"
-      password: "dsp_job"
+      url: "jdbc:postgresql://dsp-db:5432/dsp-db?currentSchema=data_migration"
+      username: "dsp"
+      password: "dsp"
       driver-class-name: "org.postgresql.Driver"
       hikari:
         maximum-pool-size: 10
@@ -61,24 +61,25 @@ batch:
   # timestamps are stored in another zone (e.g. America/Santiago).
   source-timezone: "America/Sao_Paulo"
   admin-unit:
-    # Adopter territorial hierarchy: L1 → L2 → L3 (parent_id links to the parent level).
-    # Change detection is watermark-only (updated-at-column).
+    # Adopter territorial hierarchy: L1 → L2 → L3 (parent_id links to the parent level)
     level-1:
       # Source table or SQL subquery. Replace the placeholders.
       source-table: "<source_schema>.<source_table>"
       target-table: "dsp.territory_level_1"
       primary-key: "<source_pk>"
       geometry-column: "<source_geom>"
+      creation-date-column: "<source_created_at>"
       updated-at-column: "<source_updated_at>"
       where-clause: "1=1"
       persist-columns:
         - "<source_pk>"
         - "<source_name>"
-        - "<source_updated_at>"
+        - "<source_created_at>"
       column-mapping:
         "<source_pk>": "id"
         "<source_name>": "name"
         "<source_geom>": "geom"
+        "<source_created_at>": "created_at"
         "<source_updated_at>": "updated_at"
       layer-name: "territory-level-1"
       srid: "${LAYER_SRS_TERRITORY_LEVEL_1:4326}"
@@ -89,18 +90,20 @@ batch:
       # Column used to partition the job in parallel (usually the parent).
       partition-column: "<source_parent_pk>"
       geometry-column: "<source_geom>"
+      creation-date-column: "<source_created_at>"
       updated-at-column: "<source_updated_at>"
       where-clause: "1=1"
       persist-columns:
         - "<source_pk>"
         - "<source_name>"
         - "<source_parent_pk>"
-        - "<source_updated_at>"
+        - "<source_created_at>"
       column-mapping:
         "<source_pk>": "id"
         "<source_name>": "name"
         "<source_parent_pk>": "parent_id"
         "<source_geom>": "geom"
+        "<source_created_at>": "created_at"
         "<source_updated_at>": "updated_at"
       layer-name: "territory-level-2"
       srid: "${LAYER_SRS_TERRITORY_LEVEL_2:4326}"
@@ -110,18 +113,20 @@ batch:
       primary-key: "<source_pk>"
       partition-column: "<source_parent_pk>"
       geometry-column: "<source_geom>"
+      creation-date-column: "<source_created_at>"
       updated-at-column: "<source_updated_at>"
       where-clause: "1=1"
       persist-columns:
         - "<source_pk>"
         - "<source_name>"
         - "<source_parent_pk>"
-        - "<source_updated_at>"
+        - "<source_created_at>"
       column-mapping:
         "<source_pk>": "id"
         "<source_name>": "name"
         "<source_parent_pk>": "parent_id"
         "<source_geom>": "geom"
+        "<source_created_at>": "created_at"
         "<source_updated_at>": "updated_at"
       layer-name: "territory-level-3"
       srid: "${LAYER_SRS_TERRITORY_LEVEL_3:4326}"
@@ -143,31 +148,24 @@ batch:
     creation-date-column: "<source_created_at>"
     updated-at-column: "<source_updated_at>"
     commune-id-column: "<source_territory_level_3_fk>"
+    territory-level-3-column: "<source_territory_level_3_fk>"
+    total-area-column: "<source_area>"
     geometry-column: "<source_geom>"
     where-clause: "1=1"
-    persist-columns: []
+    additional-columns: []
     layer-name: "area-of-interest"
     srid: "${LAYER_SRS_AREA_OF_INTEREST:4326}"
-  # Generic layers: job creates dsp.<table> on geo-target automatically.
-  # Canonical source columns map to fixed target names:
-  #   primary-key → id
-  #   area-of-interest-id-column → area_of_interest_id
-  #   updated-at-column → updated_at
-  #   label-column → label
-  #   geometry-column → geom
-  # Generated from adopter-config etl.layers by ./config.sh.
-  # Example (commented — filled by ./config.sh):
   # layers:
   #   - source-table: "conservation.mixed_geometries"
   #     primary-key: "feature_id"
   #     area-of-interest-id-column: "conservation_unit_id"
+  #     creation-date-column: "<source_created_at>"
   #     updated-at-column: "updated_at"
   #     label-column: "name"
   #     geometry-column: "boundary"
   #     layer-name: "mixed_geometries"
   #     srid: 4326
   #     where-clause: "1=1"
-  #     enabled: true
   layers: []
 
 # Theme KPI mappings: generated from installation.kpis in adopter-config.yaml.

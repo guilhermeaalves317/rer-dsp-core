@@ -12,6 +12,7 @@ import select
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,6 @@ except ImportError:
 # URLs consumidas pelo browser, portanto passam pelo gateway (DSP_PUBLIC_BASE_URL no .env).
 PUBLIC_BASE_URL = os.environ.get("DSP_PUBLIC_BASE_URL", "http://localhost:8026").rstrip("/")
 FIXED_WMS_BASE_URL = f"{PUBLIC_BASE_URL}/geoserver-exhibition/dsp/wms"
-FIXED_WMS_BASE_URL = "http://localhost:22668/geoserver/dsp/wms"
 # Downloads use GeoServer Download (separate from map Exhibition WMS).
 FIXED_WFS_BASE_URL = f"{PUBLIC_BASE_URL}/geoserver-download/dsp/wfs"
 HEX_COLOR = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
@@ -43,7 +43,7 @@ FIXED_LAYER_IDS = {
 }
 CANONICAL_AOI_DETAIL_FIELDS = (
     "id",
-    "registration_date",
+    "created_at",
     "updated_at",
     "area",
 )
@@ -75,7 +75,7 @@ except ImportError:
 
 
 class AdopterConfigDumper(yaml.SafeDumper):
-    """Write string values in double quotes; keys, numbers, booleans and null unquoted."""
+    """Keys stay unquoted; strings use default YAML quoting (only when needed)."""
 
     def represent_mapping(self, tag, mapping, flow_style=None):
         node = super().represent_mapping(tag, mapping, flow_style)
@@ -88,12 +88,13 @@ class AdopterConfigDumper(yaml.SafeDumper):
         return node
 
 
-def represent_multiline_string(dumper: yaml.SafeDumper, value: str) -> yaml.nodes.ScalarNode:
-    style = ">" if "\n" in value else '"'
-    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+def represent_adopter_string(dumper: yaml.SafeDumper, value: str) -> yaml.nodes.ScalarNode:
+    if "\n" in value:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=">")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value)
 
 
-AdopterConfigDumper.add_representer(str, represent_multiline_string)
+AdopterConfigDumper.add_representer(str, represent_adopter_string)
 
 
 def dump_yaml(data: Any) -> str:
@@ -337,6 +338,18 @@ def ask_field(label: str, default: Any, description: str, used_in: str) -> Any:
     return ask("  Value", default)
 
 
+def ask_optional_field(label: str, default: Any, description: str, used_in: str) -> str | None:
+    print(f"\n  {label}")
+    print(f"  What: {description}")
+    print(f"  Used in: {used_in}")
+    print("  Skip: press Enter if this column is not available.")
+    raw = ask("  Value", default)
+    text = str(raw or "").strip()
+    if not text or text.lower() == "null" or "<" in text:
+        return None
+    return text
+
+
 def ask_int_field(
     label: str,
     default: Any,
@@ -457,17 +470,17 @@ def etl_field_help(field: str) -> str:
         "parent_key": "Source column linking this record to its parent territory.",
         "name_column": "Source column containing the display name.",
         "geometry_column": "Source column containing the geometry.",
-        "created_at_column": "Source column containing the registration date.",
+        "created_at_column": "Source column containing the creation timestamp.",
         "updated_at_column": (
-            "Source column with the last modification timestamp. "
-            "Used as the watermark for incremental sync."
+            "Source column with the last modification timestamp (optional). "
         ),
         "label_column": (
-            "Source column with the feature display name. "
+            "Source column with the feature display name (optional). "
             "Copied to the destination as 'label'."
         ),
         "territory_level_3_column": "Source column linking an area to territorial level 3.",
-        "persist_columns": (
+        "area_column": "Source column containing the area measurement.",
+        "additional_columns": (
             "Other source columns to copy besides the required ones. "
             "The destination keeps the same names."
         ),
@@ -475,19 +488,31 @@ def etl_field_help(field: str) -> str:
     return descriptions.get(field, "Source value used by the ETL mapping.")
 
 
-def aoi_persist_columns(values: dict[str, Any]) -> list[str]:
-    """Extra destination columns selected for AOI migration."""
+def aoi_additional_columns(values: dict[str, Any]) -> list[str]:
+    """Extra source columns selected for AOI migration (business + geo-target)."""
     aoi = get(values, "etl", "area_of_interest", default={})
-    raw = aoi.get("persist_columns") if isinstance(aoi, dict) else None
-    return parse_column_list(raw, "etl.area_of_interest.persist_columns")
+    if not isinstance(aoi, dict):
+        return []
+    return parse_column_list(aoi.get("additional_columns"), "etl.area_of_interest.additional_columns")
 
 
-def aoi_detail_field_options(persist_columns: list[str]) -> list[str]:
-    """Valid details-panel keys: persist_columns ∪ canonical ∪ calculated.*."""
+def aoi_business_only_persist_columns(values: dict[str, Any], theme_count: int) -> list[str]:
+    aoi = get(values, "etl", "area_of_interest", default={})
+    if not isinstance(aoi, dict):
+        return validate_business_only_persist_columns([], theme_count, "etl.area_of_interest.business_only_persist_columns")
+    return validate_business_only_persist_columns(
+        aoi.get("business_only_persist_columns"),
+        theme_count,
+        "etl.area_of_interest.business_only_persist_columns",
+    )
+
+
+def aoi_detail_field_options(additional_columns: list[str]) -> list[str]:
+    """Valid details-panel keys: additional_columns ∪ canonical ∪ calculated.*."""
     options: list[str] = []
     seen: set[str] = set()
     for name in (
-        list(persist_columns)
+        list(additional_columns)
         + list(CANONICAL_AOI_DETAIL_FIELDS)
         + list(CALCULATED_AOI_DETAIL_FIELDS)
     ):
@@ -500,7 +525,7 @@ def aoi_detail_field_options(persist_columns: list[str]) -> list[str]:
 
 def validate_aoi_detail_fields(
     values: dict[str, Any],
-    persist_columns: list[str],
+    additional_columns: list[str],
 ) -> list[dict[str, str]]:
     """Validate details.fields: AOI migration columns or calculated.* keys."""
     prefix = "installation.screens.detail.fields"
@@ -511,7 +536,7 @@ def validate_aoi_detail_fields(
     if not isinstance(raw, list):
         raise ValueError(f"{prefix} must be a list of field/label mappings.")
 
-    extras = set(persist_columns)
+    extras = set(additional_columns)
     calculated = set(CALCULATED_AOI_DETAIL_FIELDS)
     seen: set[str] = set()
     normalized: list[dict[str, str]] = []
@@ -553,8 +578,8 @@ def validate_aoi_detail_fields(
         if field not in extras:
             raise ValueError(
                 f"{item_prefix}.field '{field}' is not in "
-                "etl.area_of_interest.persist_columns, is not a canonical AOI column "
-                "(id, registration_date, updated_at, area), and is not a calculated "
+                "etl.area_of_interest.additional_columns, is not a canonical AOI column "
+                "(id, created_at, updated_at, area), and is not a calculated "
                 "field (calculated.latitude, calculated.longitude, "
                 "calculated.territory_level_2_name, calculated.territory_level_3_name). "
                 "Select it for AOI migration first, or remove it from details."
@@ -564,12 +589,12 @@ def validate_aoi_detail_fields(
 
 
 def ask_aoi_detail_fields(config: dict[str, Any]) -> None:
-    """Prompt for details-panel fields after persist_columns is chosen."""
-    persist = parse_column_list(
-        config["etl"]["area_of_interest"].get("persist_columns") or [],
-        "etl.area_of_interest.persist_columns",
+    """Prompt for details-panel fields after additional_columns is chosen."""
+    additional = parse_column_list(
+        config["etl"]["area_of_interest"].get("additional_columns") or [],
+        "etl.area_of_interest.additional_columns",
     )
-    options = aoi_detail_field_options(persist)
+    options = aoi_detail_field_options(additional)
     options_set = set(options)
     screens = config.setdefault("installation", {}).setdefault("screens", {})
     detail = screens.setdefault("detail", {})
@@ -598,7 +623,7 @@ def ask_aoi_detail_fields(config: dict[str, Any]) -> None:
         level3 = {}
     canonical_label_defaults = {
         "id": identifier.get("label") or "Identifier",
-        "registration_date": detail.get("registration_date_label") or "Registration date",
+        "created_at": detail.get("registration_date_label") or "Registration date",
         "updated_at": detail.get("alteration_date_label") or "Alteration date",
         "area": detail.get("area_label") or "Area",
         "calculated.latitude": detail.get("latitude_label") or "Latitude",
@@ -639,7 +664,7 @@ def ask_aoi_detail_fields(config: dict[str, Any]) -> None:
             print(
                 f"\n  These fields are not available: {', '.join(unknown)}. "
                 "Choose only from columns selected for AOI migration, "
-                "canonical columns (id, registration_date, updated_at, area), "
+                "canonical columns (id, created_at, updated_at, area), "
                 "and calculated.* keys."
             )
             continue
@@ -719,6 +744,43 @@ def require_non_blank_column(value: Any, prefix: str) -> str:
     return value.strip()
 
 
+def resolve_optional_column(value: Any, prefix: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{prefix} must be a string or null.")
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "null":
+        return None
+    if "<" in stripped:
+        raise ValueError(f"{prefix} still contains a placeholder.")
+    return stripped
+
+
+def expected_theme_source_columns(theme_count: int) -> list[str]:
+    return [f"theme_{index}" for index in range(1, theme_count + 1)]
+
+
+def validate_business_only_persist_columns(raw: Any, theme_count: int, prefix: str) -> list[str]:
+    columns = parse_column_list(raw or [], prefix)
+    if theme_count == 0:
+        if columns:
+            raise ValueError(f"{prefix} must be empty when installation.kpis.theme_count is 0.")
+        return []
+    if len(columns) != theme_count:
+        raise ValueError(
+            f"{prefix} must contain exactly {theme_count} column name(s); found {len(columns)}."
+        )
+    expected = set(expected_theme_source_columns(theme_count))
+    if set(columns) != expected:
+        raise ValueError(
+            f"{prefix} must list theme_1 … theme_{theme_count} "
+            "(source column names or SQL aliases in source_table). "
+            f"Found: {', '.join(columns)}."
+        )
+    return expected_theme_source_columns(theme_count)
+
+
 def resolve_optional_layer_field(entry: dict[str, Any], field: str, prefix: str) -> str | None:
     value = entry.get(field)
     if value is None or value == "":
@@ -737,24 +799,6 @@ def require_layer_field(entry: dict[str, Any], field: str, prefix: str) -> str:
     return value
 
 
-def normalize_adopter_layer_field_aliases(values: dict[str, Any]) -> bool:
-    """Rewrite legacy layer keys onto the current adopter-config names."""
-    changed = False
-    raw_layers = get(values, "etl", "layers", default=[]) or []
-    for entry in raw_layers:
-        if not isinstance(entry, dict):
-            continue
-        if not entry.get("parent_key"):
-            legacy = entry.get("area_of_interest_id_column")
-            if isinstance(legacy, str) and legacy.strip():
-                entry["parent_key"] = legacy.strip()
-                changed = True
-        if "area_of_interest_id_column" in entry and entry.get("parent_key"):
-            entry.pop("area_of_interest_id_column", None)
-            changed = True
-    return changed
-
-
 def reset_disabled_themes(
     config: dict[str, Any],
     template: dict[str, Any],
@@ -771,6 +815,15 @@ def reset_disabled_themes(
             if kpis.get(code) != restored:
                 changed = True
             kpis[code] = restored
+        elif not kpis.get(code, {}).get("enabled", True):
+            kpis[code]["enabled"] = True
+            changed = True
+
+    aoi = config["etl"]["area_of_interest"]
+    if theme_count == 0:
+        if aoi.get("business_only_persist_columns"):
+            aoi["business_only_persist_columns"] = []
+            changed = True
     return changed
 
 
@@ -1354,16 +1407,15 @@ def normalize_epsg(srid: Any) -> str:
 
 
 def resolve_layer_parent_key(entry: dict[str, Any]) -> str | None:
-    """Return the AOI parent_key for a generic layer (legacy: area_of_interest_id_column)."""
-    for key in ("parent_key", "area_of_interest_id_column"):
-        value = entry.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    """Return the AOI parent_key for a generic layer."""
+    value = entry.get("parent_key")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return None
 
 
 def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
-    """Validate and normalize etl.layers entries. Returns enabled layers only."""
+    """Validate and normalize etl.layers entries."""
     raw_layers = get(values, "etl", "layers", default=[])
     if raw_layers is None:
         return []
@@ -1372,14 +1424,17 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
 
     seen_tables: set[str] = set()
     seen_wms: set[str] = set(FIXED_LAYER_IDS)
-    enabled: list[dict[str, Any]] = []
+    validated: list[dict[str, Any]] = []
 
     for index, entry in enumerate(raw_layers):
         prefix = f"etl.layers[{index}]"
         if not isinstance(entry, dict):
             raise ValueError(f"{prefix} must be a mapping.")
-        if entry.get("enabled", True) is False:
-            continue
+        if "enabled" in entry:
+            raise ValueError(
+                f"{prefix}.enabled is not supported. "
+                "Remove the layer from etl.layers when it should not be migrated or shown."
+            )
 
         source_table = entry.get("source_table")
         if not isinstance(source_table, str) or not source_table.strip():
@@ -1434,8 +1489,9 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
             "source_table": source_table.strip(),
             "area_of_interest_id_column": aoi_column.strip(),
             "primary_key": require_layer_field(entry, "primary_key", prefix),
-            "updated_at_column": require_layer_field(entry, "updated_at_column", prefix),
-            "label_column": require_layer_field(entry, "label_column", prefix),
+            "created_at_column": require_layer_field(entry, "created_at_column", prefix),
+            "updated_at_column": resolve_optional_layer_field(entry, "updated_at_column", prefix),
+            "label_column": resolve_optional_layer_field(entry, "label_column", prefix),
             "geometry_column": require_layer_field(entry, "geometry_column", prefix),
             "layer_name": layer_name,
             "table": table,
@@ -1448,25 +1504,30 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
             "color": color,
             "fill_color": fill_color,
             "where_clause": str(entry.get("where_clause") or "1=1"),
-            "enabled": True,
         }
-        extras = parse_column_list(entry.get("persist_columns"), f"{prefix}.persist_columns")
+        extras = parse_column_list(
+            entry.get("additional_columns"),
+            f"{prefix}.additional_columns",
+        )
         canonical = {
             normalized["primary_key"],
             aoi_column.strip(),
-            normalized["updated_at_column"],
-            normalized["label_column"],
+            normalized["created_at_column"],
             normalized["geometry_column"],
         }
+        if normalized["updated_at_column"]:
+            canonical.add(normalized["updated_at_column"])
+        if normalized["label_column"]:
+            canonical.add(normalized["label_column"])
         for column in extras:
             if column in canonical:
                 raise ValueError(
-                    f"{prefix}.persist_columns entry '{column}' duplicates a required column mapping."
+                    f"{prefix}.additional_columns entry '{column}' duplicates a required column mapping."
                 )
         if extras:
-            normalized["persist_columns"] = extras
-        enabled.append(normalized)
-    return enabled
+            normalized["additional_columns"] = extras
+        validated.append(normalized)
+    return validated
 
 
 def build_extra_map_layer(entry: dict[str, Any], group_json_key: str) -> dict[str, Any]:
@@ -1492,52 +1553,101 @@ def build_extra_map_layer(entry: dict[str, Any], group_json_key: str) -> dict[st
     }
 
 
+ABOUT_MARKDOWN_SUFFIXES = {".md", ".markdown"}
+
+
+def slugify_about_filename(label: str, suffix: str, fallback: str) -> str:
+    """Build a destination file name from the tab label."""
+    normalized = unicodedata.normalize("NFKD", label)
+    ascii_label = normalized.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_label.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    if not slug:
+        slug = fallback
+    ext = suffix.lower() if suffix.startswith(".") else f".{suffix.lower()}"
+    if ext not in ABOUT_MARKDOWN_SUFFIXES:
+        ext = ".md"
+    return f"{slug}{ext}"
+
+
+def resolve_about_source_path(raw: str) -> Path:
+    """Resolve an absolute path, a CWD-relative path, or a ~/ path."""
+    return Path(raw).expanduser().resolve()
+
+
+def is_inside_about_dir(path: Path, about_dir: Path) -> bool:
+    """True when the file sits directly in config/about/ (not a subfolder)."""
+    try:
+        return path.resolve().parent == about_dir.resolve()
+    except OSError:
+        return False
+
+
+def is_safe_about_filename(file_name: str) -> bool:
+    """Accept only a Markdown file name, with no folder, ~, or absolute path."""
+    if not isinstance(file_name, str):
+        return False
+    name = file_name.strip()
+    if not name or name != Path(name).name:
+        return False
+    if name in {".", ".."} or "~" in name:
+        return False
+    if Path(name).is_absolute():
+        return False
+    return Path(name).suffix.lower() in ABOUT_MARKDOWN_SUFFIXES
+
+
+def about_tab_destination(label: str, source: Path, about_dir: Path, fallback: str) -> str:
+    """File name in config/about/: keep the current name if already there, else slug the label."""
+    if is_inside_about_dir(source, about_dir):
+        return source.name
+    return slugify_about_filename(label, source.suffix, fallback)
+
+
 def build_about_config(values: dict[str, Any], about_dir: Path) -> dict[str, Any]:
     """Build about-config.json from about.* adopter settings."""
     about = get(values, "about", default={}) or {}
     enabled = bool(about.get("enabled", False))
     if not enabled:
-        return {"enabled": False, "bannerTitle": "About", "defaultTabId": None, "tabs": []}
+        return {"enabled": False, "bannerTitle": "About", "tabs": []}
 
     raw_tabs = about.get("tabs")
     if not isinstance(raw_tabs, list) or not raw_tabs:
         raise ValueError("about.tabs must have at least one entry when about.enabled is true.")
 
     tabs: list[dict[str, str]] = []
-    seen_ids: set[str] = set()
     for index, tab in enumerate(raw_tabs):
         prefix = f"about.tabs[{index}]"
         if not isinstance(tab, dict):
-            raise ValueError(f"{prefix} must be a mapping with id, label, and file.")
-        tab_id = tab.get("id")
+            raise ValueError(f"{prefix} must be a mapping with label and file.")
         label = tab.get("label")
         file_name = tab.get("file")
-        if not isinstance(tab_id, str) or not tab_id.strip():
-            raise ValueError(f"{prefix}.id is required.")
         if not isinstance(label, str) or not label.strip():
             raise ValueError(f"{prefix}.label is required.")
         if not isinstance(file_name, str) or not file_name.strip():
             raise ValueError(f"{prefix}.file is required.")
-        tab_id = tab_id.strip()
         file_name = file_name.strip()
-        if tab_id in seen_ids:
-            raise ValueError(f"about.tabs: duplicate id '{tab_id}'.")
-        seen_ids.add(tab_id)
+        if not is_safe_about_filename(file_name):
+            raise ValueError(
+                f"{prefix}.file '{file_name}' must be a .md or .markdown file name "
+                f"inside {about_dir} (no folders or absolute paths). "
+                "Use ./config.sh to copy a file from elsewhere."
+            )
         if not (about_dir / file_name).is_file():
             raise ValueError(
-                f"{prefix}.file '{file_name}' does not exist in {about_dir}. "
-                "Create the Markdown file before running ./config.sh."
+                f"{prefix}.file '{file_name}' does not exist in {about_dir}."
             )
-        tabs.append({"id": tab_id, "label": label.strip(), "file": file_name})
-
-    default_tab_id = about.get("default_tab_id")
-    if default_tab_id not in seen_ids:
-        default_tab_id = tabs[0]["id"]
+        tabs.append(
+            {
+                "id": f"tab-{index + 1}",
+                "label": label.strip(),
+                "file": file_name,
+            }
+        )
 
     return {
         "enabled": True,
         "bannerTitle": str(about.get("banner_title") or "About"),
-        "defaultTabId": default_tab_id,
         "tabs": tabs,
     }
 
@@ -1630,17 +1740,19 @@ def build_batch_layers(extra_layers: list[dict[str, Any]]) -> list[dict[str, Any
             "source-table": entry["source_table"],
             "primary-key": entry["primary_key"],
             "area-of-interest-id-column": entry["area_of_interest_id_column"],
-            "updated-at-column": entry["updated_at_column"],
-            "label-column": entry["label_column"],
+            "creation-date-column": entry["created_at_column"],
             "geometry-column": entry["geometry_column"],
             "layer-name": entry["layer_name"],
             "srid": entry["srid"],
             "where-clause": entry["where_clause"],
-            "enabled": True,
         }
-        extras = entry.get("persist_columns") or []
+        if entry.get("updated_at_column"):
+            item["updated-at-column"] = entry["updated_at_column"]
+        if entry.get("label_column"):
+            item["label-column"] = entry["label_column"]
+        extras = entry.get("additional_columns") or []
         if extras:
-            item["persist-columns"] = extras
+            item["additional-columns"] = extras
         batch_layers.append(item)
     return batch_layers
 
@@ -1712,9 +1824,8 @@ def ask_screen_text_fields(screens: dict[str, Any]) -> None:
         "the home screen search form",
     )
 
-    print("\n  Home detail labels")
-    print("  What: Text shown on the registration detail panel after a search.")
-    print("  Used in: the home screen detail panel")
+    print("\n  --- Home detail labels ---")
+    print("  Text shown on the registration detail panel after a search.")
     detail = screens.setdefault("detail", {})
     detail_fields = (
         ("section_title", "Detail section title", "Search details"),
@@ -1733,9 +1844,8 @@ def ask_screen_text_fields(screens: dict[str, Any]) -> None:
             "the home screen detail panel",
         )
 
-    print("\n  Downloads screen labels")
-    print("  What: Text shown on filters and section headers in the downloads screen.")
-    print("  Used in: the downloads screen")
+    print("\n  --- Downloads screen labels ---")
+    print("  Text shown on filters and section headers in the downloads screen.")
     downloads = screens.setdefault("downloads", {})
     theme = downloads.setdefault("theme", {})
     theme["label"] = ask_field(
@@ -1810,9 +1920,21 @@ def ask_generic_layer_entry(
             break
         print("\n  Enter the source column name.")
     entry["parent_key"] = aoi_column
-    entry.pop("area_of_interest_id_column", None)
 
-    for field in ("primary_key", "updated_at_column", "label_column", "geometry_column"):
+    for field in ("primary_key", "created_at_column", "updated_at_column", "label_column", "geometry_column"):
+        if field in ("updated_at_column", "label_column"):
+            while True:
+                value = ask_optional_field(
+                    field,
+                    entry.get(field) or "",
+                    etl_field_help(field),
+                    "the ETL job mapping for this layer",
+                )
+                if value is None or ("<" not in value):
+                    entry[field] = value
+                    break
+                print("\n  Enter the source column name.")
+            continue
         while True:
             value = str(
                 ask_field(
@@ -1827,10 +1949,10 @@ def ask_generic_layer_entry(
                 break
             print("\n  Enter the source column name.")
 
-    entry["persist_columns"] = ask_optional_column_list(
+    entry["additional_columns"] = ask_optional_column_list(
         "Extra columns to migrate",
-        entry.get("persist_columns") or [],
-        etl_field_help("persist_columns"),
+        entry.get("additional_columns") or [],
+        etl_field_help("additional_columns"),
         "the ETL job mapping for this layer",
     )
     entry["where_clause"] = ask_field(
@@ -1911,7 +2033,6 @@ def ask_generic_layer_entry(
         "the map and generated GeoServer style",
         allow_transparent=True,
     )
-    entry["enabled"] = True
     return entry
 
 
@@ -2048,14 +2169,14 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
     print("Stage 2/5 — Source tables, columns, and migration jobs")
     print("=" * 72)
     for name, fields in (
-        ("level1", ("source_table", "primary_key", "name_column", "geometry_column", "updated_at_column")),
+        ("level1", ("source_table", "primary_key", "name_column", "geometry_column", "created_at_column", "updated_at_column")),
         (
             "level2",
-            ("source_table", "primary_key", "parent_key", "name_column", "geometry_column", "updated_at_column"),
+            ("source_table", "primary_key", "parent_key", "name_column", "geometry_column", "created_at_column", "updated_at_column"),
         ),
         (
             "level3",
-            ("source_table", "primary_key", "parent_key", "name_column", "geometry_column", "updated_at_column"),
+            ("source_table", "primary_key", "parent_key", "name_column", "geometry_column", "created_at_column", "updated_at_column"),
         ),
         (
             "area_of_interest",
@@ -2066,6 +2187,7 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
                 "created_at_column",
                 "updated_at_column",
                 "territory_level_3_column",
+                "area_column",
             ),
         ),
     ):
@@ -2073,6 +2195,15 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         srs_key, srs_label = ENTITY_LAYER_SRS[name]
         section = config["etl"][name]
         for field in fields:
+            section = config["etl"][name]
+            if field == "updated_at_column":
+                section[field] = ask_optional_field(
+                    field,
+                    section.get(field),
+                    etl_field_help(field),
+                    "the ETL job mapping for this entity",
+                )
+                continue
             section[field] = ask_field(
                 field, section[field],
                 etl_field_help(field),
@@ -2081,12 +2212,32 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
             if field == "geometry_column":
                 ask_entity_layer_srid(config, srs_key, srs_label)
         if name == "area_of_interest":
-            config["etl"][name]["persist_columns"] = ask_optional_column_list(
+            config["etl"][name]["additional_columns"] = ask_optional_column_list(
                 "Extra columns to migrate",
-                config["etl"][name].get("persist_columns") or [],
-                etl_field_help("persist_columns"),
+                config["etl"][name].get("additional_columns") or [],
+                etl_field_help("additional_columns"),
                 "the ETL job mapping for this entity",
             )
+            if theme_count > 0:
+                default_themes = expected_theme_source_columns(theme_count)
+                while True:
+                    selected = ask_optional_column_list(
+                        "Theme KPI columns (business_only_persist_columns)",
+                        config["etl"][name].get("business_only_persist_columns") or default_themes,
+                        etl_field_help("business_only_persist_columns"),
+                        "the ETL job mapping for this entity",
+                    )
+                    try:
+                        config["etl"][name]["business_only_persist_columns"] = validate_business_only_persist_columns(
+                            selected,
+                            theme_count,
+                            "etl.area_of_interest.business_only_persist_columns",
+                        )
+                        break
+                    except ValueError as exc:
+                        print(f"\n  {exc}")
+            else:
+                config["etl"][name]["business_only_persist_columns"] = []
         config["etl"][name]["where_clause"] = ask_field(
             "where-clause", config["etl"][name]["where_clause"],
             "Optional SQL filter applied while reading this entity.",
@@ -2240,17 +2391,16 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
     return True
 
 
-ABOUT_MAX_TABS = 8
-
-
 def ask_about_page(config: dict[str, Any], about_dir: Path) -> None:
     """Configure the optional custom About page (about.enabled + tabs)."""
     about = config.setdefault("about", {})
+    about_dir = about_dir.resolve()
     print("\n" + "=" * 72)
     print("Optional — Custom About page")
     print("=" * 72)
     print("  What: Replaces the built-in About page with tabs rendered from")
-    print(f"        Markdown files in {about_dir}")
+    print("        Markdown files. Paths outside the project are copied into")
+    print(f"        {about_dir}")
     print("  Used in: the frontend About page")
     enabled = ask_bool(
         "Enable a custom About page", bool(about.get("enabled", False))
@@ -2259,81 +2409,89 @@ def ask_about_page(config: dict[str, Any], about_dir: Path) -> None:
     if not enabled:
         return
 
-    tab_count = ask_int_field(
-        "Number of About tabs",
-        len(about.get("tabs") or []) or 1,
-        "How many tabs the About page will show.",
-        "the frontend About page",
-        minimum=1,
-        maximum=ABOUT_MAX_TABS,
-    )
-
-    existing_tabs = about.get("tabs") or []
-    tabs: list[dict[str, str]] = []
-    for index in range(tab_count):
-        existing = existing_tabs[index] if index < len(existing_tabs) else {}
-        default_id = existing.get("id") or f"tab-{index + 1}"
-        default_label = existing.get("label") or f"Tab {index + 1}"
-        default_file = existing.get("file") or ""
-
-        tab_id = ask_field(
-            f"About tab {index + 1} — id",
-            default_id,
-            "Unique identifier for this tab (used by the frontend).",
-            "the frontend About page",
-        )
-        label = ask_field(
-            f"About tab {index + 1} — label",
-            default_label,
-            "Text shown on the tab.",
-            "the frontend About page",
-        )
-        while True:
-            file_name = str(
-                ask_field(
-                    f"About tab {index + 1} — Markdown file",
-                    default_file or "overview.md",
-                    f"File name relative to {about_dir} (must already exist there).",
-                    "the frontend About page",
-                )
-            ).strip()
-            if not file_name or "<" in file_name:
-                print("\n  Enter a file name (e.g. overview.md).")
-                continue
-            if not (about_dir / file_name).is_file():
-                print(
-                    f"\n  File not found: {about_dir / file_name}. "
-                    f"Create it in {about_dir} first (see the .md.example files there)."
-                )
-                continue
-            break
-        tabs.append({"id": str(tab_id).strip(), "label": str(label).strip(), "file": file_name})
-
-    ids = [tab["id"] for tab in tabs]
-    if len(set(ids)) != len(ids):
-        raise ValueError("about.tabs ids must be unique.")
-
-    about["tabs"] = tabs
-    default_tab_id = about.get("default_tab_id")
-    if default_tab_id not in ids:
-        default_tab_id = ids[0]
-    about["default_tab_id"] = ask_field(
-        "About page — default tab id",
-        default_tab_id,
-        "Tab id shown by default when the About page opens.",
-        "the frontend About page",
-    )
-    if about["default_tab_id"] not in ids:
-        raise ValueError(
-            f"about.default_tab_id '{about['default_tab_id']}' must match one of the tab ids: "
-            + ", ".join(ids)
-        )
     about["banner_title"] = ask_field(
         "About page — banner title",
         about.get("banner_title", "About"),
         "Title shown at the top of the About page.",
         "the frontend About page",
     )
+
+    tab_count = ask_int_field(
+        "Number of About tabs",
+        len(about.get("tabs") or []) or 1,
+        "How many tabs the About page will show.",
+        "the frontend About page",
+        minimum=1,
+    )
+
+    existing_tabs = about.get("tabs") or []
+    tabs: list[dict[str, str]] = []
+    for index in range(tab_count):
+        existing = existing_tabs[index] if index < len(existing_tabs) else {}
+        default_label = existing.get("label") or f"Tab {index + 1}"
+        existing_file = str(existing.get("file") or "").strip()
+        default_path = ""
+        if existing_file:
+            candidate = about_dir / existing_file
+            if candidate.is_file():
+                default_path = str(candidate)
+
+        while True:
+            label = str(
+                ask_field(
+                    f"About tab {index + 1} — label",
+                    default_label,
+                    "Text shown on the tab.",
+                    "the frontend About page",
+                )
+            ).strip()
+            if label:
+                break
+            print("\n  Enter a non-empty tab label.")
+
+        fallback = f"tab-{index + 1}"
+        while True:
+            raw_path = str(
+                ask_field(
+                    f"About tab {index + 1} — Markdown file",
+                    default_path,
+                    "Path to a .md or .markdown file on this computer. "
+                    f"Files outside {about_dir} are copied there.",
+                    "the frontend About page",
+                )
+            ).strip()
+            if not raw_path or "<" in raw_path:
+                print("\n  Enter a path to a Markdown file (e.g. ~/docs/overview.md).")
+                continue
+            source = resolve_about_source_path(raw_path)
+            if not source.is_file():
+                print(f"\n  File not found: {source}")
+                continue
+            if source.suffix.lower() not in ABOUT_MARKDOWN_SUFFIXES:
+                print("\n  The file must have a .md or .markdown extension.")
+                continue
+            dest_name = about_tab_destination(label, source, about_dir, fallback)
+            if not is_safe_about_filename(dest_name):
+                print("\n  The destination file name is not allowed.")
+                continue
+            dest = about_dir / dest_name
+            if is_inside_about_dir(source, about_dir):
+                tabs.append({"label": label, "file": dest_name})
+                break
+            if dest.exists() and dest.resolve() != source.resolve():
+                if not ask_bool(f"Overwrite existing file {dest.name}", False):
+                    print("\n  Choose a different Markdown file.")
+                    continue
+            try:
+                about_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest)
+            except OSError as exc:
+                print(f"\n  Could not copy the file: {exc}")
+                continue
+            tabs.append({"label": label, "file": dest_name})
+            break
+
+    about["tabs"] = tabs
 
 
 def replace_env(env_file: Path, values: dict[str, Any]) -> None:
@@ -2367,7 +2525,10 @@ def replace_env(env_file: Path, values: dict[str, Any]) -> None:
 def set_source_mapping(section: dict[str, Any], values: dict[str, Any]) -> None:
     primary_key = require_non_blank_column(values.get("primary_key"), "primary-key")
     geometry_column = require_non_blank_column(values.get("geometry_column"), "geometry-column")
-    updated_at_column = require_non_blank_column(
+    creation_date_column = require_non_blank_column(
+        values.get("created_at_column"), "created-at-column"
+    )
+    updated_at_column = resolve_optional_column(
         values.get("updated_at_column"), "updated-at-column"
     )
     name_column = values.get("name_column")
@@ -2384,30 +2545,37 @@ def set_source_mapping(section: dict[str, Any], values: dict[str, Any]) -> None:
     section["source-table"] = values["source_table"]
     section["primary-key"] = primary_key
     section["geometry-column"] = geometry_column
-    section["updated-at-column"] = updated_at_column
+    section["creation-date-column"] = creation_date_column
+    if updated_at_column:
+        section["updated-at-column"] = updated_at_column
+    else:
+        section.pop("updated-at-column", None)
     section["where-clause"] = values.get("where_clause") or "1=1"
     if parent_key:
         section["partition-column"] = parent_key
     else:
         section.pop("partition-column", None)
 
-    persist = [primary_key]
+    persist = [primary_key, creation_date_column]
     if name_column:
         persist.append(name_column)
     if parent_key:
         persist.append(parent_key)
-    persist.append(updated_at_column)
+    if updated_at_column:
+        persist.append(updated_at_column)
     section["persist-columns"] = persist
 
     mapping = {
         primary_key: "id",
         geometry_column: "geom",
-        updated_at_column: "updated_at",
+        creation_date_column: "created_at",
     }
     if name_column:
         mapping[name_column] = "name"
     if parent_key:
         mapping[parent_key] = "parent_id"
+    if updated_at_column:
+        mapping[updated_at_column] = "updated_at"
     section["column-mapping"] = mapping
     section.pop("comparison-columns", None)
     section.pop("change-detection-strategy", None)
@@ -2442,13 +2610,18 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     validate_theme_kpis(values)
     config_changed = reset_disabled_themes(values, template, theme_count)
     config_changed = sync_map_layer_names(values) or config_changed
-    config_changed = normalize_adopter_layer_field_aliases(values) or config_changed
     if config_changed:
         write_adopter_config(active, values, template)
     source_values = []
     for entity in ("level1", "level2", "level3", "area_of_interest"):
         entity_values = get(values, "etl", entity, default={})
         source_values.extend(entity_values.values())
+        if not isinstance(entity_values, dict):
+            continue
+        for key, value in entity_values.items():
+            if key in {"additional_columns", "business_only_persist_columns"}:
+                continue
+            source_values.append(value)
     invalid = [
         str(value)
         for value in source_values
@@ -2473,8 +2646,9 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
                 f"map.layers.{layer_name}.fill_color must be 'transparent' or a #RGB/#RRGGBB value."
             )
     extra_layers = validate_extra_layers(values)
-    persist_columns = aoi_persist_columns(values)
-    aoi_detail_fields = validate_aoi_detail_fields(values, persist_columns)
+    additional_columns = aoi_additional_columns(values)
+    business_only_columns = aoi_business_only_persist_columns(values, theme_count)
+    aoi_detail_fields = validate_aoi_detail_fields(values, additional_columns)
     if coerce_map_initial_view_to_planet(values):
         write_adopter_config(active, values, template)
     map_initial_view = validate_map_initial_view(values)
@@ -2600,6 +2774,10 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         set_source_mapping(migration["batch"]["admin-unit"][name.replace("level", "level-")], etl[name])
     aoi = migration["batch"]["area-of-interest"]
     aoi_values = etl["area_of_interest"]
+    updated_at_column = resolve_optional_column(
+        aoi_values.get("updated_at_column"),
+        "etl.area_of_interest.updated_at_column",
+    )
     aoi.update(
         {
             "source-table": aoi_values["source_table"],
@@ -2610,11 +2788,7 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
                 aoi_values.get("created_at_column"),
                 "etl.area_of_interest.created_at_column",
             ),
-            "updated-at-column": require_non_blank_column(
-                aoi_values.get("updated_at_column"),
-                "etl.area_of_interest.updated_at_column",
-            ),
-            "commune-id-column": require_non_blank_column(
+            "territory-level-3-column": require_non_blank_column(
                 aoi_values.get("territory_level_3_column"),
                 "etl.area_of_interest.territory_level_3_column",
             ),
@@ -2625,21 +2799,28 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
             "where-clause": aoi_values.get("where_clause") or "1=1",
         }
     )
-    extras = persist_columns
+    if updated_at_column:
+        aoi["updated-at-column"] = updated_at_column
+    else:
+        aoi.pop("updated-at-column", None)
     canonical_source = {
         aoi["primary-key"],
         aoi["creation-date-column"],
+        aoi["territory-level-3-column"],
+        aoi["total-area-column"],
         aoi["updated-at-column"],
         aoi["commune-id-column"],
         aoi["geometry-column"],
     }
-    for column in extras:
+    if updated_at_column:
+        canonical_source.add(updated_at_column)
+    for column in additional_columns:
         if column in canonical_source:
             raise ValueError(
-                "etl.area_of_interest.persist_columns entry "
+                "etl.area_of_interest.additional_columns entry "
                 f"'{column}' duplicates a required column mapping."
             )
-    aoi["persist-columns"] = extras
+    aoi["additional-columns"] = additional_columns
     aoi.pop("comparison-columns", None)
     aoi.pop("column-mapping", None)
     aoi.pop("change-detection-strategy", None)

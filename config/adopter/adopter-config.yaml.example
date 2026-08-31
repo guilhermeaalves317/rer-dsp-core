@@ -4,7 +4,7 @@
 # DSP contract keys are kept by the core templates.
 # To fill in this file step by step, run: ./config.sh
 # Wizard order: 1 database, 2 tables/jobs, 3 application, 4 interface, 5 KPI configuration.
-# Strings are quoted. Numbers, booleans and null are not.
+# Quote strings only when YAML requires it (special characters). Numbers, booleans and null are not.
 
 environment:
   # Source database connection used by the migration.
@@ -46,7 +46,8 @@ etl:
     primary_key: "<source_pk>"
     name_column: "<source_name>"
     geometry_column: "<source_geom>"
-    updated_at_column: "<source_updated_at>"
+    created_at_column: "<source_created_at>"
+    updated_at_column: "<source_updated_at>"         # optional column
     where_clause: "1=1"
   level2:
     source_table: "<source_schema>.<source_table>"
@@ -54,7 +55,8 @@ etl:
     parent_key: "<source_parent_pk>"
     name_column: "<source_name>"
     geometry_column: "<source_geom>"
-    updated_at_column: "<source_updated_at>"
+    created_at_column: "<source_created_at>"
+    updated_at_column: "<source_updated_at>"          # optional column
     where_clause: "1=1"
   level3:
     source_table: "<source_schema>.<source_table>"
@@ -62,25 +64,20 @@ etl:
     parent_key: "<source_parent_pk>"
     name_column: "<source_name>"
     geometry_column: "<source_geom>"
-    updated_at_column: "<source_updated_at>"
+    created_at_column: "<source_created_at>"
+    updated_at_column: "<source_updated_at>"           # optional column
     where_clause: "1=1"
   area_of_interest:
     source_table: "<source_schema>.<source_table>"
     primary_key: "<source_pk>"
     geometry_column: "<source_geom>"
     created_at_column: "<source_created_at>"
-    updated_at_column: "<source_updated_at>"
+    updated_at_column: "<source_updated_at>"           # optional column
     territory_level_3_column: "<source_territory_level_3_fk>"
-    # Extra source columns copied as-is to both destinations (optional).
-    # YAML list, e.g. ["owner", "status", "year"]. Empty [] when none.
-    persist_columns: []
+    area_column: "<source_area>"
+    additional_columns: []
     where_clause: "1=1"
-  jobs:
-    level1: true
-    level2: true
-    level3: true
-    area_of_interest: true
-    layer_jobs: true
+
   # Extra geographic layers (generic). Each item migrates to dsp.<table> on
   # geoserver-db, is published to GeoServer, and appears in the map panel.
   # Presentation and ETL share one entry to avoid drift. Leave empty when unused.
@@ -90,13 +87,13 @@ etl:
   #     - source_table: "<schema>.<table>"   # origin schema (e.g. public) — never dsp
   #       parent_key: "<source_parent_pk>"   # AOI FK (e.g. aeroporto_id)
   #       primary_key: "<source_pk>"
-  #       updated_at_column: "<source_updated_at>"
-  #       label_column: "<source_name>"
+  #       created_at_column: "<source_created_at>"
+  #       updated_at_column: "<source_updated_at>"      # optional column
+  #       label_column: "<source_name>"                 # optional column
   #       geometry_column: "<source_geom>"
-  #       persist_columns: []                # optional extras, e.g. ["owner", "status"]
+  #       additional_columns: []
   #       layer_name: "<wms_id>"             # technical id (lowercase, hyphens ok)
   #       srid: 4326
-  #       enabled: true
   #       where_clause: "1=1"
   #       display_name: "<ui_label>"         # human-readable map label
   #       group_key: "<group_key>"           # map.group_names key (or new key)
@@ -104,6 +101,13 @@ etl:
   #       color: "#2563EB"
   #       fill_color: "transparent"
   layers: []
+  jobs:
+    level1: true
+    level2: true
+    level3: true
+    area_of_interest: true
+    layer_jobs: true
+
   parallelization:
     level1:
       thread_pool_size: 1
@@ -185,7 +189,7 @@ installation:
       features_download_label: "Download features"
       # Optional. Fields shown on the details panel (order is kept).
       # Mix destination column names with calculated.* keys.
-      # Columns: persist_columns extras, or canonical id / registration_date /
+      # Columns: additional_columns extras, or canonical id / created_at /
       # updated_at / area.
       # calculated.* is calculated by the application, not a source column:
       #   calculated.latitude, calculated.longitude,
@@ -251,11 +255,10 @@ map:
 about:
   # Custom "About" page, built from Markdown files in config/about/.
   # enabled: false hides the page entirely.
-  # Each tab file must exist in config/about/ before ./config.sh is run.
+  # file is only the file name already in config/about/ (e.g. overview.md).
+  # Use ./config.sh to copy a .md from anywhere on this computer into that folder.
   enabled: false
   banner_title: "About"
-  default_tab_id: "overview"
   tabs:
-    - id: "overview"
-      label: "Overview"
+    - label: "Overview"
       file: "overview.md"
