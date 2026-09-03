@@ -492,7 +492,7 @@ yaml_target_table() {
   yaml_scalar "$1" "$2" "target-table"
 }
 
-# Print ETL lines for batch.layers (generic layers → geo-target dsp.<source_table>).
+# Print ETL lines for batch.layers (generic layers → geo-target dsp.<layer_name>).
 # Prints nothing when the list is empty or missing (caller shows "(none)").
 yaml_generic_layers_etl_lines() {
   local file="$1"
@@ -505,7 +505,10 @@ yaml_generic_layers_etl_lines() {
       if (src == "") return
       n = split(src, parts, ".")
       tbl = parts[n]
-      tgt = "dsp." tbl
+      phys = lname
+      gsub(/-/, "_", phys)
+      if (phys == "") phys = tbl
+      tgt = "dsp." phys
       status = ""
       if (enabled == "false") status = " (disabled)"
       if (lname != "") {
