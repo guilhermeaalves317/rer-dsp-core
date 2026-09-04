@@ -59,6 +59,12 @@ AOI_CANONICAL_TARGET_COLUMNS = (
     "area",
     "geom",
 )
+RESERVED_DESTINATION_TABLES = {
+    "territory_level_1",
+    "territory_level_2",
+    "territory_level_3",
+    "area_of_interest",
+}
 CANONICAL_AOI_DETAIL_FIELDS = (
     "id",
     "created_at",
@@ -1222,24 +1228,26 @@ def sync_map_layer_names(config: dict[str, Any]) -> bool:
     return changed
 
 
+def split_schema_table(source_table: str) -> tuple[str, str]:
+    """Split schema.table (exactly one '.'), matching the job QualifiedTable contract."""
+    qualified = str(source_table).strip()
+    parts = qualified.split(".")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError(
+            f"source_table must be schema.table with exactly one '.' "
+            f"(got {source_table!r})."
+        )
+    return parts[0].strip(), parts[1].strip()
+
+
 def table_name_from_source(source_table: str) -> str:
     """Return the unqualified table name (schema discarded), matching the job contract."""
-    qualified = str(source_table).strip()
-    if "." not in qualified:
-        raise ValueError(
-            f"etl.layers source_table must be schema.table (got {source_table!r})."
-        )
-    return qualified.rsplit(".", 1)[-1].strip()
+    return split_schema_table(source_table)[1]
 
 
 def source_schema_from_table(source_table: str) -> str:
     """Return the schema part of schema.table."""
-    qualified = str(source_table).strip()
-    if "." not in qualified:
-        raise ValueError(
-            f"etl.layers source_table must be schema.table (got {source_table!r})."
-        )
-    return qualified.rsplit(".", 1)[0].strip()
+    return split_schema_table(source_table)[0]
 
 
 def validate_layer_name(layer_name: str, prefix: str = "layer_name") -> str:
@@ -1261,7 +1269,7 @@ def validate_source_table_schema(source_table: str, prefix: str) -> None:
         table = table_name_from_source(source_table)
         raise ValueError(
             f"{prefix}.source_table must use the origin schema, not '{DESTINATION_SCHEMA}'. "
-            f"The job migrates schema.table → {DESTINATION_SCHEMA}.{table}. "
+            f"The job writes extra layers into '{DESTINATION_SCHEMA}' on geo-target. "
             f"Example: public.{table}"
         )
 
@@ -1271,6 +1279,11 @@ def resolve_layer_name(entry: dict[str, Any]) -> str:
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     return table_name_from_source(entry["source_table"])
+
+
+def physical_table_name(layer_name: str) -> str:
+    """Physical table id: WMS may use hyphens; the table uses underscores."""
+    return layer_name.replace("-", "_")
 
 
 def normalize_epsg(srid: Any) -> str:
@@ -1365,7 +1378,7 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("etl.layers must be a list.")
 
     seen_tables: set[str] = set()
-    seen_wms: set[str] = set(FIXED_LAYER_IDS)
+    seen_wms: set[str] = set()
     validated: list[dict[str, Any]] = []
 
     for index, entry in enumerate(raw_layers):
@@ -1389,16 +1402,18 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
         if not aoi_column:
             raise ValueError(f"{prefix}.parent_key is required.")
 
-        table = table_name_from_source(source_table)
-        if table in seen_tables:
-            raise ValueError(
-                f"{prefix}: duplicate target table dsp.{table} "
-                "(two source tables must not share the same table name)."
-            )
-        seen_tables.add(table)
-
         layer_name = validate_layer_name(resolve_layer_name(entry), f"{prefix}.layer_name")
+        table = physical_table_name(layer_name)
         wms_id = f"dsp:{layer_name}"
+        if wms_id in FIXED_LAYER_IDS:
+            raise ValueError(f"{prefix}: WMS id {wms_id} collides with another layer.")
+        if table in RESERVED_DESTINATION_TABLES:
+            raise ValueError(
+                f"{prefix}: target table dsp.{table} is reserved for a fixed migration."
+            )
+        if table in seen_tables:
+            raise ValueError(f"{prefix}: duplicate target table dsp.{table}.")
+        seen_tables.add(table)
         if wms_id in seen_wms:
             raise ValueError(f"{prefix}: WMS id {wms_id} collides with another layer.")
         seen_wms.add(wms_id)
@@ -1814,9 +1829,71 @@ def ask_screen_text_fields(screens: dict[str, Any]) -> None:
     )
 
 
+# Source structure fields. Can be reused as default
+# when another layer of the same source_table is configured in this wizard.
+SOURCE_STRUCTURE_FIELDS = (
+    "parent_key",
+    "primary_key",
+    "created_at_column",
+    "updated_at_column",
+    "label_column",
+    "geometry_column",
+    "additional_columns",
+    "srid",
+)
+
+
+def snapshot_source_structure(entry: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the source structure fields (wizard memory)."""
+    snapshot: dict[str, Any] = {}
+    for field in SOURCE_STRUCTURE_FIELDS:
+        if field in entry:
+            snapshot[field] = copy.deepcopy(entry[field])
+    return snapshot
+
+
+def remember_source_structure(
+    memory: dict[str, dict[str, Any]],
+    entry: dict[str, Any],
+) -> None:
+    """Remember the last structure mapping for this layer's source_table."""
+    source_table = str(entry.get("source_table") or "").strip()
+    if not source_table:
+        return
+    memory[source_table] = snapshot_source_structure(entry)
+
+
+def lookup_source_structure(
+    memory: dict[str, dict[str, Any]] | None,
+    source_table: str,
+) -> dict[str, Any]:
+    """Return the last mapping for this source in this execution, or empty."""
+    if not memory:
+        return {}
+    previous = memory.get(source_table)
+    return copy.deepcopy(previous) if previous else {}
+
+
+def apply_source_structure_defaults(
+    entry: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> None:
+    """Fill empty structure fields with the last mapping from the source."""
+    if not previous:
+        return
+    for field in SOURCE_STRUCTURE_FIELDS:
+        current = entry.get(field)
+        if current not in (None, ""):
+            continue
+        if field not in previous:
+            continue
+        entry[field] = copy.deepcopy(previous[field])
+
+
 def ask_generic_layer_entry(
     config: dict[str, Any],
     entry: dict[str, Any] | None,
+    source_structure_by_table: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Ask every field of one generic layer (migration + map presentation)."""
     entry = copy.deepcopy(entry) if entry else {}
@@ -1826,20 +1903,26 @@ def ask_generic_layer_entry(
         source_table = str(
             ask_field(
                 "Source table", default_source,
-                "Origin table (schema.table). Destination is always dsp.<table> — do not use schema 'dsp'.",
+                "Origin table (schema.table). Destination is dsp.<layer_name> "
+                "(hyphens become underscores). Do not use schema 'dsp'.",
                 "the migration job (reads from your source database)",
             )
         ).strip()
-        if "." not in source_table or "<" in source_table:
+        if "<" in source_table:
             print("\n  Enter the origin table as schema.table (e.g. public.my_layer).")
             continue
         try:
+            split_schema_table(source_table)
             validate_source_table_schema(source_table, "etl.layers")
         except ValueError as exc:
             print(f"\n  {exc}")
             continue
         break
     entry["source_table"] = source_table
+    apply_source_structure_defaults(
+        entry,
+        lookup_source_structure(source_structure_by_table, source_table),
+    )
 
     while True:
         aoi_column = str(
@@ -1890,12 +1973,13 @@ def ask_generic_layer_entry(
         "the ETL source query",
     )
 
-    default_layer_name = entry.get("layer_name") or source_table.rsplit(".", 1)[-1]
+    default_layer_name = entry.get("layer_name") or table_name_from_source(source_table)
     while True:
         raw_name = str(
             ask_field(
                 "Layer name", default_layer_name,
-                "Technical WMS id (lowercase, digits, hyphens, underscores). Published as dsp:<name>.",
+                "Technical WMS id (lowercase, digits, hyphens, underscores). "
+                "Published as dsp:<name>; physical table is dsp.<name> with hyphens as underscores.",
                 "GeoServer and the map layer selector",
             )
         ).strip()
@@ -1970,9 +2054,10 @@ def ask_generic_layers(config: dict[str, Any]) -> None:
     etl = config["etl"]
     declared = list(etl.get("layers") or [])
     result: list[dict[str, Any]] = []
+    source_structure_by_table: dict[str, dict[str, Any]] = {}
 
     print("\n  Generic layers")
-    print("  What: extra source tables migrated to dsp.<table> and published as WMS layers.")
+    print("  What: extra source tables migrated to dsp.<layer_name> and published as WMS layers.")
     print("  Used in: the migration job, GeoServer publishing, and the map layer selector")
 
     for item in declared:
@@ -1982,7 +2067,7 @@ def ask_generic_layers(config: dict[str, Any]) -> None:
         if not ask_bool("  Keep this layer", True):
             continue
         if ask_bool("  Edit this layer", False):
-            item = ask_generic_layer_entry(config, item)
+            item = ask_generic_layer_entry(config, item, source_structure_by_table)
         else:
             blocked = layer_canonical_source_columns(item)
             try:
@@ -2009,10 +2094,13 @@ def ask_generic_layers(config: dict[str, Any]) -> None:
                 item = copy.deepcopy(item)
                 item["additional_columns"] = ask_layer_additional_columns(item)
         result.append(item)
+        remember_source_structure(source_structure_by_table, item)
 
     add_next = not result
     while ask_bool("\n  Add a generic layer" if not result else "\n  Add another generic layer", add_next):
-        result.append(ask_generic_layer_entry(config, None))
+        item = ask_generic_layer_entry(config, None, source_structure_by_table)
+        result.append(item)
+        remember_source_structure(source_structure_by_table, item)
         add_next = False
 
     etl["layers"] = result
