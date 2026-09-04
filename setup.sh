@@ -184,6 +184,7 @@ echo "Day-to-day: prefer ./start.sh (does not re-run migration)."
 if [ "$KEEP_MIGRATION_SERVICE" = "true" ]; then
   print_migration_resync_hints
 fi
+print_geo_file_generation_hints
 echo "Rebuild only frontend: docker compose up -d --build dsp-frontend"
 echo "Reset DBs (lose data): docker compose down -v && ./setup.sh"
 echo ""

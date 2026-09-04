@@ -17,6 +17,20 @@ environment:
     territory_level_2: 4326
     territory_level_3: 4326
     area_of_interest: 4326
+  # Object storage with S3 API, where the pre-generated download files are published.
+  # The bucket must already exist: the job never creates it. With an empty endpoint the
+  # geo file job stays off and downloads keep going straight to the WFS.
+  object_storage:
+    endpoint: ""
+    region: "us-east-1"
+    bucket: "dsp-geo-files"
+    access_key: ""
+    secret_key: ""
+    # Path-style keeps the bucket in the path instead of the host name; endpoints that
+    # are not AWS usually need it on.
+    path_style_access: true
+    # Cron of the pre-generation job, in a window after the migration.
+    generation_cron: "0 2 * * *"
 
 etl:
   # Enter the tables and columns available in the source database.

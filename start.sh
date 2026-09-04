@@ -71,6 +71,7 @@ step_header 7 "Databases"
 
 start_databases_and_wait "false"
 ensure_migration_service_if_needed
+ensure_geo_file_generation_service_if_needed
 if is_persistent_migration_mode; then
   info "Migration service stack is active ($(get_migration_execution_mode))."
 else
@@ -92,3 +93,4 @@ start_gateway
 print_stack_summary
 print_stack_urls with-status
 print_stack_usage_hints
+print_geo_file_generation_hints

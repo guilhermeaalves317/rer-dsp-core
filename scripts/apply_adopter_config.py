@@ -59,6 +59,17 @@ AOI_CANONICAL_TARGET_COLUMNS = (
     "area",
     "geom",
 )
+# Defaults of environment.object_storage, used when the block is absent from an
+# adopter-config.yaml written before the pre-generation feature existed.
+OBJECT_STORAGE_DEFAULTS = {
+    "endpoint": "",
+    "region": "us-east-1",
+    "bucket": "dsp-geo-files",
+    "access_key": "",
+    "secret_key": "",
+    "path_style_access": True,
+    "generation_cron": "0 2 * * *",
+}
 RESERVED_DESTINATION_TABLES = {
     "territory_level_1",
     "territory_level_2",
@@ -2392,6 +2403,7 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         "Pattern for dates with time (e.g. dd/MM/yyyy HH:mm).",
         "detail screens",
     )
+    ask_object_storage(config)
 
     print("\n" + "=" * 72)
     print("Stage 4/4 — Interface")
@@ -2464,6 +2476,66 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
     write_adopter_config(active, config, template)
     print(f"\nConfiguration saved to {active}")
     return True
+
+
+def ask_object_storage(config: dict[str, Any]) -> None:
+    """Collects the object storage credentials for the pre-generated download files.
+
+    The whole block is optional: without an endpoint the pre-generation job stays off and
+    downloads keep going straight to the WFS, which is the behaviour before this feature.
+    """
+    storage = config["environment"].setdefault(
+        "object_storage", copy.deepcopy(OBJECT_STORAGE_DEFAULTS)
+    )
+    print("\nObject storage for pre-generated download files (optional)")
+    print("  Leave the endpoint empty to keep serving downloads from the WFS only.")
+    storage["endpoint"] = ask_optional_field(
+        "Object storage endpoint (S3 API)",
+        storage.get("endpoint") or "",
+        "Address of the S3-compatible API. Empty disables the pre-generation job.",
+        "the geo file generation job and the backend",
+    ) or ""
+    if not storage["endpoint"]:
+        print("  Pre-generation disabled: downloads keep using the WFS.")
+        return
+    storage["bucket"] = ask_field(
+        "Bucket", storage.get("bucket") or OBJECT_STORAGE_DEFAULTS["bucket"],
+        "Bucket where the files are published. It must already exist — the job never creates it.",
+        "the geo file generation job and the backend",
+    )
+    storage["region"] = ask_field(
+        "Region", storage.get("region") or OBJECT_STORAGE_DEFAULTS["region"],
+        "Region reported to the S3 API. Endpoints that ignore it accept any value.",
+        "the geo file generation job and the backend",
+    )
+    storage["access_key"] = ask_field(
+        "Access key", storage.get("access_key") or "",
+        "Credential with write access for the job and read access for the backend.",
+        "the geo file generation job, the backend and .env",
+    )
+    storage["secret_key"] = ask_field(
+        "Secret key", storage.get("secret_key") or "",
+        "Secret paired with the access key.",
+        "the geo file generation job, the backend and .env",
+    )
+    storage["path_style_access"] = ask_bool_field(
+        "Path-style access",
+        bool(storage.get("path_style_access", True)),
+        "Keeps the bucket in the path instead of the host name. Endpoints that are not "
+        "AWS usually need it on.",
+        "the S3 client of the job and the backend",
+    )
+    while True:
+        cron = ask_field(
+            "Pre-generation cron",
+            storage.get("generation_cron") or OBJECT_STORAGE_DEFAULTS["generation_cron"],
+            "Schedule of the geo file job, in a window after the migration (5 fields).",
+            "the dsp-job-geo-file-generation service",
+        )
+        if len(str(cron).split()) == 5:
+            storage["generation_cron"] = str(cron)
+            break
+        print("\n  The cron needs 5 fields (minute hour day month weekday).")
 
 
 def ask_about_page(config: dict[str, Any], about_dir: Path) -> None:
@@ -2582,6 +2654,21 @@ def replace_env(env_file: Path, values: dict[str, Any]) -> None:
     srs = get(values, "environment", "layer_srs", default={})
     for name, value in srs.items():
         replacements[f"LAYER_SRS_{name.upper()}"] = value
+    storage = object_storage_settings(values)
+    replacements.update(
+        {
+            "DSP_OBJECT_STORAGE_ENDPOINT": storage["endpoint"],
+            "DSP_OBJECT_STORAGE_REGION": storage["region"],
+            "DSP_OBJECT_STORAGE_BUCKET": storage["bucket"],
+            "DSP_OBJECT_STORAGE_ACCESS_KEY": storage["access_key"],
+            "DSP_OBJECT_STORAGE_SECRET_KEY": storage["secret_key"],
+            "DSP_OBJECT_STORAGE_PATH_STYLE_ACCESS": str(
+                bool(storage["path_style_access"])
+            ).lower(),
+            # Quoted because the value carries spaces, like DSP_MIGRATION_CRON.
+            "DSP_GEO_FILE_GENERATION_CRON": f"\"{storage['generation_cron']}\"",
+        }
+    )
     result = []
     seen = set()
     for line in lines:
@@ -2656,6 +2743,32 @@ def set_source_mapping(section: dict[str, Any], values: dict[str, Any]) -> None:
     section.pop("change-detection-strategy", None)
 
 
+def object_storage_settings(values: dict[str, Any]) -> dict[str, Any]:
+    """Reads environment.object_storage, filling in what the adopter did not declare."""
+    settings = dict(OBJECT_STORAGE_DEFAULTS)
+    declared = get(values, "environment", "object_storage", default={})
+    if isinstance(declared, dict):
+        for key in settings:
+            value = declared.get(key)
+            if value is not None and value != "":
+                settings[key] = value
+    settings["endpoint"] = str(settings["endpoint"]).strip()
+    settings["path_style_access"] = bool(settings["path_style_access"])
+    cron = str(settings["generation_cron"]).strip()
+    if len(cron.split()) != 5:
+        raise ValueError(
+            "environment.object_storage.generation_cron must have 5 fields "
+            "(minute hour day month weekday)."
+        )
+    settings["generation_cron"] = cron
+    if settings["endpoint"] and not (settings["access_key"] and settings["secret_key"]):
+        raise ValueError(
+            "environment.object_storage needs access_key and secret_key when endpoint is set. "
+            "Clear the endpoint to keep downloads on the WFS only."
+        )
+    return settings
+
+
 def validate_job_migration_path(root: Path) -> None:
     raw = read_dotenv_value(
         root / ".env",
@@ -2674,6 +2787,34 @@ def validate_job_migration_path(root: Path) -> None:
             f"(expected Dockerfile). Clone rer-dsp-job-data-migration "
             f"or set DSP_JOB_MIGRATION_PATH in .env."
         )
+
+
+def write_geo_file_generation_config(root: Path, values: dict[str, Any]) -> dict[str, Any]:
+    """Generates the runtime YAML of the pre-generation job from the adopter values.
+
+    The connection details also go to .env, because Compose passes them to the backend,
+    which reads the same bucket.
+    """
+    storage = object_storage_settings(values)
+    example = root / "config/Job-Geo-File-Generation/application/application.yaml.example"
+    document = yaml.safe_load(example.read_text(encoding="utf-8"))
+    document["dsp"]["object-storage"].update(
+        {
+            "endpoint": storage["endpoint"],
+            "region": storage["region"],
+            "bucket": storage["bucket"],
+            "access-key": storage["access_key"],
+            "secret-key": storage["secret_key"],
+            "path-style-access": storage["path_style_access"],
+        }
+    )
+    # No endpoint means no storage to publish to: the job runs and does nothing, which
+    # is noisier than not running it.
+    document["execution-jobs"]["geo-file-generation-job"] = bool(storage["endpoint"])
+    output = root / "config/Job-Geo-File-Generation/application/application.yaml"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(dump_yaml(document), encoding="utf-8")
+    return storage
 
 
 def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
@@ -2915,12 +3056,21 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     migration["execution-jobs"]["layer-jobs"] = layer_jobs_enabled
     output = root / "config/Job-Data-Migration/application/application.yaml"
     output.write_text(dump_yaml(migration), encoding="utf-8")
+
+    storage = write_geo_file_generation_config(root, values)
     replace_env(root / ".env", values)
     if not quiet:
         print("Configuration files generated successfully.")
         if extra_layers:
             print(f"  Generic layers: {len(extra_layers)} (layer-jobs={layer_jobs_enabled})")
         print(f"  Download themes: {len(download_themes.get('themes', []))}")
+        if storage["endpoint"]:
+            print(
+                f"  Pre-generated files: bucket '{storage['bucket']}' "
+                f"at {storage['endpoint']} (cron {storage['generation_cron']})"
+            )
+        else:
+            print("  Pre-generated files: disabled (downloads served by the WFS)")
         print("\nNext steps:")
         print(f"  1. Review: {active}")
         print(

@@ -794,6 +794,7 @@ require_docker() {
 DSP_REPO_BACKEND_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-backend.git"
 DSP_REPO_FRONTEND_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-frontend.git"
 DSP_REPO_JOB_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-job-data-migration.git"
+DSP_REPO_GEO_FILE_JOB_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-job-geo-file-generation.git"
 
 require_git() {
   if ! command -v git >/dev/null 2>&1; then
@@ -895,6 +896,7 @@ ensure_dsp_repositories() {
   local want_backend=false
   local want_frontend=false
   local want_job=false
+  local want_geo_file_job=false
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -907,6 +909,9 @@ ensure_dsp_repositories() {
       --job)
         want_job=true
         ;;
+      --geo-file-job)
+        want_geo_file_job=true
+        ;;
       *)
         error "Unknown ensure_dsp_repositories option: $1"
         exit 1
@@ -915,8 +920,9 @@ ensure_dsp_repositories() {
     shift
   done
 
-  if [ "$want_backend" = false ] && [ "$want_frontend" = false ] && [ "$want_job" = false ]; then
-    error "ensure_dsp_repositories: pass at least one of --backend, --frontend, --job"
+  if [ "$want_backend" = false ] && [ "$want_frontend" = false ] && [ "$want_job" = false ] \
+    && [ "$want_geo_file_job" = false ]; then
+    error "ensure_dsp_repositories: pass at least one of --backend, --frontend, --job, --geo-file-job"
     exit 1
   fi
 
@@ -979,6 +985,14 @@ ensure_dsp_repositories() {
       "${DSP_JOB_MIGRATION_PATH:-../rer-dsp-job-data-migration}" \
       "$DSP_REPO_JOB_URL" \
       "Migration job"
+  fi
+
+  if [ "$want_geo_file_job" = true ]; then
+    _ensure_dsp_repo_check \
+      "rer-dsp-job-geo-file-generation" \
+      "${DSP_JOB_GEO_FILE_GENERATION_PATH:-../rer-dsp-job-geo-file-generation}" \
+      "$DSP_REPO_GEO_FILE_JOB_URL" \
+      "Geo file generation job"
   fi
 
   if [ "${#missing_labels[@]}" -eq 0 ]; then
@@ -1160,6 +1174,41 @@ ensure_migration_service_if_needed() {
     return 0
   fi
   start_migration_service_stack
+}
+
+# The endpoint is the switch: without a place to publish to, the job has nothing to do
+# and downloads keep coming from the WFS.
+is_geo_file_generation_enabled() {
+  [ -n "${DSP_OBJECT_STORAGE_ENDPOINT:-}" ]
+}
+
+start_geo_file_generation_service() {
+  info "Starting geo file generation service (profile=geo-file)..."
+  wait_for_data_migration_schema
+  docker compose --env-file .env --profile geo-file up -d --build dsp-job-geo-file-generation
+  ok "Geo file generation service ready (cron=${DSP_GEO_FILE_GENERATION_CRON:-0 2 * * *})"
+}
+
+ensure_geo_file_generation_service_if_needed() {
+  if ! is_geo_file_generation_enabled; then
+    return 0
+  fi
+  ensure_dsp_repositories --geo-file-job
+  start_geo_file_generation_service
+}
+
+print_geo_file_generation_hints() {
+  if ! is_geo_file_generation_enabled; then
+    echo ""
+    echo "Pre-generated download files: disabled (downloads served by the WFS)."
+    echo "Run ./config.sh and fill in the object storage endpoint to enable them."
+    return 0
+  fi
+  echo ""
+  echo "Pre-generated download files: bucket ${DSP_OBJECT_STORAGE_BUCKET:-dsp-geo-files}" \
+    "at ${DSP_OBJECT_STORAGE_ENDPOINT} (cron=${DSP_GEO_FILE_GENERATION_CRON:-0 2 * * *})"
+  echo "Optional one-shot generation (in addition to the schedule):"
+  echo "  docker compose --env-file .env --profile geo-file run --rm -e DSP_GEO_FILE_GENERATION_EXECUTION_MODE=once dsp-job-geo-file-generation"
 }
 
 print_migration_resync_hints() {
