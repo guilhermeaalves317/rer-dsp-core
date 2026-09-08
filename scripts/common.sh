@@ -590,14 +590,6 @@ yaml_generic_layers_etl_lines() {
   ' "$file"
 }
 
-job_enabled_label() {
-  if [ "${1:-false}" = "true" ]; then
-    echo "enabled"
-  else
-    echo "disabled"
-  fi
-}
-
 # Resolve ${VAR_NAME} using a variable already exported in the shell (.env).
 resolve_env_placeholder() {
   local raw="$1"
@@ -616,12 +608,29 @@ resolve_env_placeholder() {
 print_migration_preview() {
   local cfg="$1"
   local will_run="${2:-false}"
-  local run_label="disabled"
+  local first_run_label=""
+  local recurrence_label=""
   if [ "$will_run" = "true" ]; then
-    run_label="enabled (runs during this setup)"
-  elif [ "${KEEP_MIGRATION_SERVICE:-false}" = "true" ]; then
-    run_label="scheduled (${MIGRATION_EXECUTION_MODE:-unknown})"
+    first_run_label="during this setup"
+  elif [ -n "${MIGRATION_SCHEDULED_AT:-}" ]; then
+    first_run_label="scheduled at ${MIGRATION_SCHEDULED_AT} (${DSP_MIGRATION_TZ})"
+  else
+    first_run_label="not configured"
   fi
+  case "${MIGRATION_EXECUTION_MODE:-once}" in
+    once)
+      recurrence_label="one-time"
+      ;;
+    scheduled-once)
+      recurrence_label="one-time (scheduled)"
+      ;;
+    continuous)
+      recurrence_label="continuous"
+      ;;
+    *)
+      recurrence_label="${MIGRATION_EXECUTION_MODE:-unknown}"
+      ;;
+  esac
 
   local batch_url source_url target_url
   local batch_user source_user target_user
@@ -647,20 +656,11 @@ print_migration_preview() {
   local generic_layers_lines
   generic_layers_lines="$(yaml_generic_layers_etl_lines "$cfg")"
 
-  local j1 j2 j3 j_aoi j_layers
-  j1="$(yaml_scalar "$cfg" "execution-jobs" "admin-unit-level-1-geoserver-job")"
-  j2="$(yaml_scalar "$cfg" "execution-jobs" "admin-unit-level-2-geoserver-job")"
-  j3="$(yaml_scalar "$cfg" "execution-jobs" "admin-unit-level-3-geoserver-job")"
-  j_aoi="$(yaml_scalar "$cfg" "execution-jobs" "area-of-interest-geoserver-job")"
-  j_layers="$(yaml_scalar "$cfg" "execution-jobs" "layer-jobs")"
-
   info "Migration configuration preview:"
-  echo "  Job execution: ${run_label}"
+  echo "  First run: ${first_run_label}"
+  echo "  Recurrence: ${recurrence_label}"
   if [ -n "${MIGRATION_CRON:-}" ]; then
     echo "  Cron: ${MIGRATION_CRON} (tz=${DSP_MIGRATION_TZ})"
-  fi
-  if [ -n "${MIGRATION_SCHEDULED_AT:-}" ]; then
-    echo "  Scheduled at: ${MIGRATION_SCHEDULED_AT} (tz=${DSP_MIGRATION_TZ})"
   fi
   echo "  Datasources:"
   echo "    batch:  ${batch_url:-<missing>} (user: ${batch_user:-<missing>})"
@@ -677,12 +677,6 @@ print_migration_preview() {
   else
     echo "      (none)"
   fi
-  echo "  Jobs:"
-  echo "    level 1: $(job_enabled_label "$j1")"
-  echo "    level 2: $(job_enabled_label "$j2")"
-  echo "    level 3: $(job_enabled_label "$j3")"
-  echo "    area of interest: $(job_enabled_label "$j_aoi")"
-  echo "    layer jobs: $(job_enabled_label "$j_layers")"
 }
 
 wait_for_db() {
@@ -1020,11 +1014,11 @@ ensure_dsp_repositories() {
 reject_legacy_migration_env() {
   if [ -n "${DSP_RUN_MIGRATION+x}" ]; then
     error "DSP_RUN_MIGRATION is no longer supported."
-    error "Remove it from .env and choose option 2 or 3 in ./setup.sh."
+    error "Remove it from .env and run ./setup.sh (Real adopter)."
     exit 1
   fi
   if [ -n "${DSP_SKIP_MIGRATION+x}" ]; then
-    error "DSP_SKIP_MIGRATION is no longer supported. Remove it from .env and choose option 3 in ./setup.sh if you do not want to migrate."
+    error "DSP_SKIP_MIGRATION is no longer supported. Remove it from .env and run ./setup.sh again."
     exit 1
   fi
   if [ -n "${DSP_MIGRATION_SYNC_INTERVAL:-}" ]; then
@@ -1427,7 +1421,8 @@ show_stack_status_menu() {
 }
 
 # Interactive data-prep menu for ./setup.sh.
-# Sets globals: SETUP_MODE (demo|real), WILL_MIGRATE, INCLUDE_MIGRATION_DB.
+# Sets globals: SETUP_MODE (demo|real), WILL_MIGRATE, KEEP_MIGRATION_SERVICE,
+# MIGRATION_EXECUTION_MODE, MIGRATION_CRON, MIGRATION_SCHEDULED_AT.
 # Not a command substitution on purpose: error output must reach the terminal.
 prompt_setup_data_mode() {
   echo ""
@@ -1442,41 +1437,28 @@ prompt_setup_data_mode() {
   echo "     Requires ./config.sh first, then runs ETL from your JDBC source into dsp-db and the GeoServer DB."
   echo "     Use for a production-like setup when your source database is ready to import."
   echo ""
-  echo "  3) Real adopter — no migration (empty DBs, UI/GeoServer config only)"
-  echo "     Applies adopter configuration (labels, map layers, SRIDs) but keeps databases empty."
-  echo "     Use when setting up the stack before data is available, or when you will migrate later with option 2."
-  echo ""
-  echo "  4) Stack status / cleanup / exit"
+  echo "  3) Stack status / cleanup / exit"
   echo "     Shows container status and service URLs; optionally removes this project's Docker resources, then exits."
   echo "     Use to inspect the stack or reset containers/volumes without loading or migrating data."
   echo ""
   echo "How do you want to prepare data?"
   local choice=""
-  read -r -p "Choice [1/2/3/4]: " choice || true
+  read -r -p "Choice [1/2/3]: " choice || true
   case "$choice" in
     1)
       SETUP_MODE="demo"
       WILL_MIGRATE=false
-      INCLUDE_MIGRATION_DB=false
       KEEP_MIGRATION_SERVICE=false
       ;;
     2)
       SETUP_MODE="real"
-      WILL_MIGRATE=true
-      INCLUDE_MIGRATION_DB=true
-      prompt_migration_execution_mode
+      prompt_real_adopter_migration_plan
       ;;
     3)
-      SETUP_MODE="real"
-      WILL_MIGRATE=false
-      INCLUDE_MIGRATION_DB=true
-      prompt_deferred_migration_plan
-      ;;
-    4)
       show_stack_status_menu
       ;;
     *)
-      error "Invalid choice: '${choice}' — use 1 (demonstration), 2 (real + ETL), 3 (real without migration) or 4 (status)."
+      error "Invalid choice: '${choice}' — use 1 (demonstration), 2 (real adopter) or 3 (status)."
       error "Run './${DSP_ORCHESTRATION_SCRIPT}' again."
       exit 1
       ;;
@@ -1500,23 +1482,21 @@ prompt_migration_hhmm() {
   done
 }
 
-# Sets MIGRATION_CRON. Time is asked only for "every day" when no clock was already chosen (option 2).
-# $1 optional HH:MM from option 3 When — reused for daily cron, not asked again.
+# Sets MIGRATION_CRON. Time is asked only for "every day" when no clock was already chosen.
+# $1 optional HH:MM from a scheduled first run — reused for daily cron, not asked again.
 prompt_migration_how_often() {
   local hhmm="${1:-}"
   local freq_choice step
   echo ""
-  echo "How often should synchronization run?"
+  echo "How often should the data be synchronized after the initial migration?"
   echo ""
   if [ -n "$hhmm" ]; then
-    echo "  1) Every day at that time (${hhmm})"
+    echo "  1) Every day at this time (${hhmm})"
   else
     echo "  1) Every day at a given time"
   fi
   echo "  2) Every N hours"
-  echo "     N must divide 24 (1, 2, 3, 4, 6, 8, 12 or 24)."
   echo "  3) Every N minutes"
-  echo "     N is 1–59 (useful for local testing)."
   echo ""
   while true; do
     read -r -p "Choice [1]: " freq_choice || true
@@ -1544,6 +1524,11 @@ prompt_migration_how_often() {
           step="6"
         fi
         if MIGRATION_CRON="$(dsp_build_hourly_cron "$step")"; then
+          case "$step" in
+            6) echo "  Runs at 00:00, 06:00, 12:00, and 18:00." ;;
+            24) echo "  Runs once per day at 00:00." ;;
+            *) echo "  Runs at minute 0 every ${step} hours (aligned to midnight)." ;;
+          esac
           break
         fi
         error "Invalid interval: '${step}' — use 1, 2, 3, 4, 6, 8, 12 or 24."
@@ -1565,12 +1550,12 @@ prompt_migration_how_often() {
   ok "Schedule cron: ${MIGRATION_CRON}"
 }
 
-# Option 3 + once or continuous. Sets MIGRATION_SCHEDULED_AT and MIGRATION_HHMM.
+# Scheduled first run. Sets MIGRATION_SCHEDULED_AT and MIGRATION_HHMM.
 # Fuso: DSP_MIGRATION_TZ (já carregado do .env por ensure_dotenv).
 prompt_migration_when() {
   local date_ymd today
   echo ""
-  echo "When should the migration start?"
+  echo "Enter the date and time for the first migration:"
   today="$(TZ="${DSP_MIGRATION_TZ}" date +%F)"
   while true; do
     read -r -p "Date (YYYY-MM-DD) [${today}]: " date_ymd || true
@@ -1591,71 +1576,85 @@ prompt_migration_when() {
   done
 }
 
-# Option 3: same 1/2 choices, wording does not claim the job runs during this setup.
-prompt_deferred_migration_plan() {
-  KEEP_MIGRATION_SERVICE=true
+# Real adopter: when to run the first migration, then one-time vs continuous.
+prompt_real_adopter_migration_plan() {
+  local when_choice how_choice run_now=false
+
+  WILL_MIGRATE=false
+  KEEP_MIGRATION_SERVICE=false
   MIGRATION_CRON=""
   MIGRATION_SCHEDULED_AT=""
+
   echo ""
-  echo "How should the migration job run after setup?"
+  echo "When should the initial migration run?"
   echo ""
-  echo "  1) One-time migration"
-  echo "     Does not run during this setup. Runs once at the time you choose next,"
-  echo "     then stops and removes the migration job Docker container."
+  echo "  1) Run now"
+  echo "     Runs the first migration during this setup."
   echo ""
-  echo "  2) Continuous service (periodic re-sync)"
-  echo "     Does not run during this setup. Starts at the time you choose, then keeps"
-  echo "     the job container running and re-syncs from the source on a schedule you choose."
+  echo "  2) Schedule for later"
+  echo "     Waits until the date and time you choose, then runs the first migration."
   echo ""
-  local choice=""
-  read -r -p "Choice [1/2]: " choice || true
-  case "$choice" in
+  read -r -p "Choice [1/2]: " when_choice || true
+  case "$when_choice" in
     1|"")
-      MIGRATION_EXECUTION_MODE="scheduled-once"
-      prompt_migration_when
+      run_now=true
       ;;
     2)
-      MIGRATION_EXECUTION_MODE="continuous"
+      run_now=false
       prompt_migration_when
-      prompt_migration_how_often "$MIGRATION_HHMM"
       ;;
     *)
-      error "Invalid choice: '${choice}' — use 1 (one-time) or 2 (continuous service)."
+      error "Invalid choice: '${when_choice}' — use 1 (run now) or 2 (schedule for later)."
       error "Run './${DSP_ORCHESTRATION_SCRIPT}' again."
       exit 1
       ;;
   esac
-}
 
-# Sets global MIGRATION_EXECUTION_MODE (once|continuous) after option 2 in ./setup.sh.
-# When continuous, also sets MIGRATION_CRON via prompt_migration_how_often.
-prompt_migration_execution_mode() {
-  KEEP_MIGRATION_SERVICE=false
-  MIGRATION_CRON=""
-  MIGRATION_SCHEDULED_AT=""
   echo ""
-  echo "How should the migration job run after setup?"
+  echo "How should the migration run?"
   echo ""
-  echo "  1) One-time initial migration (recommended for first import)"
-  echo "     Runs the job once during setup, then stops and removes the migration job Docker container."
+  echo "  1) One-time"
+  if [ "$run_now" = "true" ]; then
+    echo "     Runs once during this setup, then stops the migration job container."
+  else
+    echo "     Runs once at the scheduled time, then stops the migration job container."
+  fi
   echo ""
-  echo "  2) Continuous service (periodic re-sync)"
-  echo "     Runs the initial migration, then keeps the job container running"
-  echo "     and re-syncs from the source on an interval you choose."
+  echo "  2) Continuous (periodic re-sync)"
+  if [ "$run_now" = "true" ]; then
+    echo "     Runs the first migration during this setup, then keeps the job container"
+    echo "     running and re-syncs from the source on a recurring schedule you choose next."
+  else
+    echo "     Runs the first migration at the scheduled time, then keeps the job container"
+    echo "     running and re-syncs from the source on a recurring schedule you choose next."
+  fi
   echo ""
-  local choice=""
-  read -r -p "Choice [1/2]: " choice || true
-  case "$choice" in
+  read -r -p "Choice [1/2]: " how_choice || true
+  case "$how_choice" in
     1|"")
-      MIGRATION_EXECUTION_MODE="once"
+      if [ "$run_now" = "true" ]; then
+        WILL_MIGRATE=true
+        MIGRATION_EXECUTION_MODE="once"
+        KEEP_MIGRATION_SERVICE=false
+      else
+        WILL_MIGRATE=false
+        MIGRATION_EXECUTION_MODE="scheduled-once"
+        KEEP_MIGRATION_SERVICE=true
+      fi
       ;;
     2)
       MIGRATION_EXECUTION_MODE="continuous"
       KEEP_MIGRATION_SERVICE=true
-      prompt_migration_how_often
+      if [ "$run_now" = "true" ]; then
+        WILL_MIGRATE=true
+        prompt_migration_how_often
+      else
+        WILL_MIGRATE=false
+        prompt_migration_how_often "$MIGRATION_HHMM"
+      fi
       ;;
     *)
-      error "Invalid choice: '${choice}' — use 1 (one-time) or 2 (continuous service)."
+      error "Invalid choice: '${how_choice}' — use 1 (one-time) or 2 (continuous)."
       error "Run './${DSP_ORCHESTRATION_SCRIPT}' again."
       exit 1
       ;;
