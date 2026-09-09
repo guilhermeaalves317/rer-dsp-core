@@ -69,7 +69,7 @@ fi
 
 step_header 7 "Databases"
 
-start_databases_and_wait "false"
+start_databases_and_wait
 ensure_migration_service_if_needed
 if is_persistent_migration_mode; then
   info "Migration service stack is active ($(get_migration_execution_mode))."

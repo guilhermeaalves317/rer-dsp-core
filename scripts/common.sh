@@ -694,8 +694,43 @@ wait_for_db() {
   return 1
 }
 
-# pg_isready answers while /docker-entrypoint-initdb.d scripts are still running,
-# so wait for a schema created by the init SQL before touching the tables.
+# pg_isready alone is not enough on a fresh volume: the entrypoint may still be PID 1
+# while a temporary PostgreSQL serves /docker-entrypoint-initdb.d scripts.
+_postgres_definitive_and_ready() {
+  local service="$1"
+  local user="$2"
+  local db="$3"
+  local comm=""
+
+  comm="$(docker compose --env-file .env exec -T "$service" \
+    sh -c 'tr -d "\0" < /proc/1/comm 2>/dev/null' 2>/dev/null | tr -d '[:space:]')"
+  if [ "$comm" != "postgres" ]; then
+    return 1
+  fi
+
+  docker compose --env-file .env exec -T "$service" \
+    pg_isready -U "$user" -d "$db" >/dev/null 2>&1
+}
+
+wait_for_postgres_initialization() {
+  local service="$1"
+  local user="$2"
+  local db="$3"
+  local i
+
+  for i in $(seq 1 90); do
+    if _postgres_definitive_and_ready "$service" "$user" "$db"; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  error "${service} did not finish PostgreSQL initialization in time (PID 1 is not postgres or pg_isready failed)."
+  docker compose --env-file .env logs --tail 40 "$service" || true
+  return 1
+}
+
+# Confirms init SQL created the expected schema (call after wait_for_postgres_initialization).
 wait_for_db_schema() {
   local service="$1"
   local user="$2"
@@ -715,13 +750,12 @@ wait_for_db_schema() {
 }
 
 wait_for_data_migration_schema() {
-  info "Waiting for dsp-db schema data_migration..."
   if ! wait_for_db_schema dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}" data_migration; then
     error "dsp-db init SQL did not create schema 'data_migration' in time."
     docker compose --env-file .env logs --tail 40 dsp-db || true
-    exit 1
+    return 1
   fi
-  ok "dsp-db schema data_migration ready"
+  return 0
 }
 
 validate_positive_integer() {
@@ -1135,7 +1169,12 @@ run_migration_job_once() {
 
 start_migration_service_stack() {
   info "Starting migration service stack (profile=migration)..."
-  wait_for_data_migration_schema
+  if ! wait_for_postgres_initialization dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}"; then
+    exit 1
+  fi
+  if ! wait_for_data_migration_schema; then
+    exit 1
+  fi
   docker compose --env-file .env --profile migration up -d --build dsp-job-migration
   if is_continuous_migration_mode; then
     docker update --restart unless-stopped dsp-job-migration >/dev/null 2>&1 || true
@@ -1203,15 +1242,12 @@ ensure_adopter_config() {
 }
 
 start_databases_and_wait() {
-  local include_migration_db="${1:-false}"
-
   info "Starting databases (dsp-db, dsp-geoserver-db)..."
   docker compose --env-file .env up -d --build dsp-db dsp-geoserver-db
   ok "Database containers started"
 
-  info "Waiting for databases to become healthy..."
-  if ! wait_for_db dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}"; then
-    error "dsp-db did not become ready in time."
+  info "Waiting for dsp-db PostgreSQL initialization..."
+  if ! wait_for_postgres_initialization dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}"; then
     exit 1
   fi
   if ! wait_for_db_schema dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}" dsp; then
@@ -1219,10 +1255,13 @@ start_databases_and_wait() {
     docker compose --env-file .env logs --tail 40 dsp-db || true
     exit 1
   fi
+  if ! wait_for_data_migration_schema; then
+    exit 1
+  fi
   ok "dsp-db ready"
 
-  if ! wait_for_db dsp-geoserver-db "${DSP_GEOSERVER_DB_USER:-dsp_geo}" "${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db}"; then
-    error "dsp-geoserver-db did not become ready in time."
+  info "Waiting for dsp-geoserver-db PostgreSQL initialization..."
+  if ! wait_for_postgres_initialization dsp-geoserver-db "${DSP_GEOSERVER_DB_USER:-dsp_geo}" "${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db}"; then
     exit 1
   fi
   if ! wait_for_db_schema dsp-geoserver-db "${DSP_GEOSERVER_DB_USER:-dsp_geo}" "${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db}" dsp; then
@@ -1232,9 +1271,6 @@ start_databases_and_wait() {
   fi
   ok "dsp-geoserver-db ready"
 
-  if [ "$include_migration_db" = "true" ]; then
-    wait_for_data_migration_schema
-  fi
   ok "Databases are ready"
 }
 

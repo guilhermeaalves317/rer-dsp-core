@@ -54,7 +54,7 @@ if [ "$SETUP_MODE" = "demo" ]; then
   fi
 
   step_header 6 "Databases"
-  start_databases_and_wait false
+  start_databases_and_wait
 
   step_header 7 "Quickstart seed"
   apply_quickstart_seed
@@ -132,7 +132,7 @@ fi
 
 step_header 9 "Databases (+ migration)"
 
-start_databases_and_wait true
+start_databases_and_wait
 
 if [ "$WILL_MIGRATE" = "true" ]; then
   info "Running initial data migration (profile=migration)..."
