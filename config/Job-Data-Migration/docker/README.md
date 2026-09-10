@@ -4,7 +4,7 @@ The image is built from the sibling repository Dockerfile:
 
 `../rer-dsp-job-data-migration/Dockerfile` (path configurable via `DSP_JOB_MIGRATION_PATH`).
 
-The `dsp-job-migration` service uses Compose profile `migration`. Batch metadata lives in `dsp-db` schema `data_migration`.
+The `dsp-job-migration` service uses Compose profile `migration`. Batch metadata lives in `dsp-db` schema `data_migration` (exclusive to this job; the geo-file job uses `geo_file_generation`).
 
 ## Entrypoint
 

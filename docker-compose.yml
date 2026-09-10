@@ -225,6 +225,7 @@ services:
       # External prefix differs from the internal one: without this, generated links would point at /geoserver.
       PROXY_BASE_URL: ${DSP_PUBLIC_BASE_URL:-http://localhost:8026}/geoserver-download
       GEOSERVER_DATA_DIR: /var/geoserver/datadir
+      TZ: UTC
       RUN_UNPRIVILEGED: "true"
       RUN_WITH_USER_UID: "999"
       RUN_WITH_USER_GID: "999"

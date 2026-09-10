@@ -8,9 +8,9 @@ spring:
   main:
     web-application-type: "none"
   datasource:
-    # Shares the migration's Spring Batch metadata schema: same tables, another job name.
+    # Spring Batch metadata for this job only. data_migration belongs to the migration job.
     batch:
-      url: "jdbc:postgresql://dsp-db:5432/dsp-db?currentSchema=data_migration"
+      url: "jdbc:postgresql://dsp-db:5432/dsp-db?currentSchema=geo_file_generation"
       username: "dsp"
       password: "dsp"
       driver-class-name: "org.postgresql.Driver"

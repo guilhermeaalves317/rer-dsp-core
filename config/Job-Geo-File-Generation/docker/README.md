@@ -6,8 +6,9 @@ The image is built from the sibling repository Dockerfile:
 
 The `dsp-job-geo-file-generation` service uses Compose profile `geo-file`. It publishes the
 territorial download files (levels 2 and 3) to the object storage so that `/downloads/file`
-does not have to query the WFS. Batch metadata lives in `dsp-db` schema `data_migration`, in
-the same tables as the migration — the job name is what separates them.
+does not have to query the WFS. Batch metadata lives in `dsp-db` schema `geo_file_generation`
+(tables `BATCH_*` exclusive to this job). The migration job keeps its own schema
+`data_migration`.
 
 The bucket must already exist: the job never creates it. Without a bucket it logs the error,
 publishes nothing and exits with success, so the stack keeps running and the territorial
@@ -38,7 +39,7 @@ and writes them to `application/application.yaml` and to `.env`. An empty endpoi
 the job disabled and downloads keep going straight to the WFS.
 
 The backend reads the same bucket (`DSP_OBJECT_STORAGE_*` in `.env`) to serve the file and
-to report `lastUpdate`.
+to report `lastFileGenerated` from the object metadata `generated-at`.
 
 ## Commands
 

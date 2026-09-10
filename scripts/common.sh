@@ -730,6 +730,46 @@ wait_for_data_migration_schema() {
   ok "dsp-db schema data_migration ready"
 }
 
+dsp_db_schema_exists() {
+  local schema="$1"
+  docker compose --env-file .env exec -T dsp-db \
+      psql -U "${DSP_DB_USER:-dsp}" -d "${DSP_DB_NAME:-dsp-db}" -tAc \
+      "SELECT 1 FROM information_schema.schemata WHERE schema_name = '${schema}'" \
+      2>/dev/null | grep -q '^1$'
+}
+
+# Init SQL in the dsp-db image only runs on an empty volume. Existing installs
+# get the geo-file Batch schema by applying the same file once (CREATE IF NOT EXISTS).
+apply_geo_file_generation_schema_if_missing() {
+  local sql="$ROOT_DIR/config/db/dsp-db/03_geo_file_generation_batch.sql"
+  if dsp_db_schema_exists geo_file_generation; then
+    return 0
+  fi
+  info "Applying geo_file_generation Spring Batch schema on dsp-db..."
+  if [ ! -f "$sql" ]; then
+    error "Missing ${sql}"
+    exit 1
+  fi
+  if ! docker compose --env-file .env exec -T dsp-db \
+      psql -U "${DSP_DB_USER:-dsp}" -d "${DSP_DB_NAME:-dsp-db}" -v ON_ERROR_STOP=1 \
+      < "$sql"; then
+    error "Failed to apply schema geo_file_generation on dsp-db."
+    docker compose --env-file .env logs --tail 40 dsp-db || true
+    exit 1
+  fi
+}
+
+wait_for_geo_file_generation_schema() {
+  apply_geo_file_generation_schema_if_missing
+  info "Waiting for dsp-db schema geo_file_generation..."
+  if ! wait_for_db_schema dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}" geo_file_generation; then
+    error "dsp-db did not create schema 'geo_file_generation' in time."
+    docker compose --env-file .env logs --tail 40 dsp-db || true
+    exit 1
+  fi
+  ok "dsp-db schema geo_file_generation ready"
+}
+
 validate_positive_integer() {
   local label="$1"
   local value="$2"
@@ -1184,7 +1224,7 @@ is_geo_file_generation_enabled() {
 
 start_geo_file_generation_service() {
   info "Starting geo file generation service (profile=geo-file)..."
-  wait_for_data_migration_schema
+  wait_for_geo_file_generation_schema
   docker compose --env-file .env --profile geo-file up -d --build dsp-job-geo-file-generation
   ok "Geo file generation service ready (cron=${DSP_GEO_FILE_GENERATION_CRON:-0 2 * * *})"
 }
@@ -2053,6 +2093,7 @@ print_stack_usage_hints() {
   echo "Verify tables:"
   echo "  docker compose exec dsp-db psql -U ${DSP_DB_USER:-dsp} -d ${DSP_DB_NAME:-dsp-db} -c '\\dt dsp.*'"
   echo "  docker compose exec dsp-db psql -U ${DSP_DB_USER:-dsp} -d ${DSP_DB_NAME:-dsp-db} -c '\\dt data_migration.*'"
+  echo "  docker compose exec dsp-db psql -U ${DSP_DB_USER:-dsp} -d ${DSP_DB_NAME:-dsp-db} -c '\\dt geo_file_generation.*'"
   echo "  docker compose exec dsp-geoserver-db psql -U ${DSP_GEOSERVER_DB_USER:-dsp_geo} -d ${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db} -c '\\dt dsp.*'"
   echo ""
   echo "Migrate / (re)populate data:"
