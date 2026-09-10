@@ -61,6 +61,44 @@ cd rer-dsp-core
 ./start.sh
 ```
 
+### Fluxo de configuração
+
+```text
+./config.sh
+    │
+    ▼
+Configura o adotante
+(JDBC, L1/L2/L3/AOI, layers opcionais, UI)
+    │
+    ▼
+./setup.sh
+    │
+    ├─► Demonstration (seed embutido, sem JDBC)
+    │
+    └─► Real adopter
+            │
+            ▼
+    When should the initial migration run?
+            │
+      ┌─────┴─────┐
+      ▼           ▼
+   Run now    Schedule for later
+      │           │
+      └─────┬─────┘
+            ▼
+    How should it run?
+            │
+      ┌─────┴─────┐
+      ▼           ▼
+   One-time    Continuous
+```
+
+- `./config.sh` — configura somente o adotante (dados, mappings, camadas, interface).
+- `./setup.sh` — escolhe demonstração ou adotante real; no adotante real, define **quando** e **como** a migração roda.
+- `./start.sh` — sobe a stack usando a configuração já definida (não pergunta agenda de migração).
+
+No wizard do `./config.sh`, L1, L2, L3 e AOI são sempre configurados; generic layers são opcionais (`etl.layers`). O `application.yaml` do job recebe `execution-jobs` derivados automaticamente (jobs estruturais sempre `true`; `layer-jobs` só quando houver generic layers).
+
 Ao final, tudo é acessível por uma única porta (default `8026`):
 
 | Serviço | URL |

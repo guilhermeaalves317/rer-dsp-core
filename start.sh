@@ -50,7 +50,7 @@ fi
 step_header 6 "Confirmation"
 
 if is_persistent_migration_mode; then
-  info "Scheduled migration is enabled — ./start.sh will keep the migration stack running when needed."
+  info "Migration service will stay running (mode=$(get_migration_execution_mode))."
   if [ -n "${DSP_MIGRATION_CRON:-}" ]; then
     info "Cron: ${DSP_MIGRATION_CRON} (tz=${DSP_MIGRATION_TZ})"
   fi
@@ -69,7 +69,7 @@ fi
 
 step_header 7 "Databases"
 
-start_databases_and_wait "false"
+start_databases_and_wait
 ensure_migration_service_if_needed
 ensure_geo_file_generation_service_if_needed
 if is_persistent_migration_mode; then

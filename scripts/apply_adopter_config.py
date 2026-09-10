@@ -483,6 +483,9 @@ def etl_field_help(field: str) -> str:
         ),
         "primary_key": "Unique source column used to identify each record.",
         "parent_key": "Source column linking this record to its parent territory.",
+        "layer_parent_key": (
+            "Source column linking this feature to its area of interest (AOI)."
+        ),
         "name_column": "Source column containing the display name.",
         "geometry_column": "Source column containing the geometry.",
         "created_at_column": "Source column containing the creation timestamp.",
@@ -491,7 +494,6 @@ def etl_field_help(field: str) -> str:
         ),
         "label_column": (
             "Source column with the feature display name (optional). "
-            "Copied to the destination as 'label'."
         ),
         "territory_level_3_column": "Source column linking an area to territorial level 3.",
         "area_column": "Source column containing the area measurement.",
@@ -979,9 +981,6 @@ def is_source_table_placeholder(source_table: str) -> bool:
 
 
 def is_territory_level_etl_configured(values: dict[str, Any], level: str) -> bool:
-    jobs = get(values, "etl", "jobs", default={}) or {}
-    if jobs.get(level) is False:
-        return False
     source_table = str(get(values, "etl", level, "source_table", default=""))
     return not is_source_table_placeholder(source_table)
 
@@ -1000,7 +999,7 @@ def is_territorial_bbox_viable(values: dict[str, Any]) -> bool:
 
 TERRITORIAL_BBOX_PLANET_REASON = (
     "Territorial geometry cannot be resolved from the ETL configuration "
-    "(no enabled level1/level2/level3 source table)."
+    "(no configured level1/level2/level3 source table)."
 )
 
 
@@ -1913,10 +1912,9 @@ def ask_generic_layer_entry(
         default_source = entry.get("source_table") or "public.my_layer"
         source_table = str(
             ask_field(
-                "Source table", default_source,
-                "Origin table (schema.table). Destination is dsp.<layer_name> "
-                "(hyphens become underscores). Do not use schema 'dsp'.",
-                "the migration job (reads from your source database)",
+                "source_table", default_source,
+                etl_field_help("source_table"),
+                "the migration job mapping for this layer",
             )
         ).strip()
         if "<" in source_table:
@@ -1935,28 +1933,26 @@ def ask_generic_layer_entry(
         lookup_source_structure(source_structure_by_table, source_table),
     )
 
-    while True:
-        aoi_column = str(
-            ask_field(
-                "parent_key",
-                resolve_layer_parent_key(entry) or "",
-                etl_field_help("parent_key"),
-                "the ETL job mapping for this entity",
-            )
-        ).strip()
-        if aoi_column and "<" not in aoi_column:
-            break
-        print("\n  Enter the source column name.")
-    entry["parent_key"] = aoi_column
-
-    for field in ("primary_key", "created_at_column", "updated_at_column", "label_column", "geometry_column"):
+    for field in (
+        "primary_key",
+        "parent_key",
+        "label_column",
+        "geometry_column",
+        "created_at_column",
+        "updated_at_column",
+    ):
+        field_help = (
+            etl_field_help("layer_parent_key")
+            if field == "parent_key"
+            else etl_field_help(field)
+        )
         if field in ("updated_at_column", "label_column"):
             while True:
                 value = ask_optional_field(
                     field,
                     entry.get(field) or "",
-                    etl_field_help(field),
-                    "the ETL job mapping for this layer",
+                    field_help,
+                    "the migration job mapping for this layer",
                 )
                 if value is None or ("<" not in value):
                     entry[field] = value
@@ -1968,8 +1964,8 @@ def ask_generic_layer_entry(
                 ask_field(
                     field,
                     entry.get(field) or "",
-                    etl_field_help(field),
-                    "the ETL job mapping for this layer",
+                    field_help,
+                    "the migration job mapping for this layer",
                 )
             ).strip()
             if value and "<" not in value:
@@ -1979,7 +1975,7 @@ def ask_generic_layer_entry(
 
     entry["additional_columns"] = ask_layer_additional_columns(entry)
     entry["where_clause"] = ask_field(
-        "where-clause", entry.get("where_clause", "1=1"),
+        "where_clause", entry.get("where_clause", "1=1"),
         "Optional SQL filter applied while reading this layer.",
         "the ETL source query",
     )
@@ -2117,30 +2113,6 @@ def ask_generic_layers(config: dict[str, Any]) -> None:
     etl["layers"] = result
 
 
-def ask_data_preparation_flow() -> bool:
-    print("\nBefore configuring a JDBC source, choose the data preparation flow:")
-    print("  1. Demonstration (built-in seed, no JDBC source or migration job)")
-    print("  2. Real adopter — migrate from JDBC source (ETL)")
-    print("  3. Real adopter — no migration (empty DBs, UI/GeoServer config only)")
-
-    while True:
-        choice = ask("Choice", "2")
-        if choice == "2":
-            return True
-        if choice == "1":
-            if ask_bool("Use the demonstration flow instead", True):
-                print("\nRun ./setup.sh and choose option 1 (Demonstration).")
-                print("This wizard will now exit without configuring a JDBC source.")
-                return False
-        elif choice == "3":
-            if ask_bool("Use the empty-database flow instead", True):
-                print("\nRun ./setup.sh and choose option 3 (Real adopter — no migration).")
-                print("This wizard will now exit without configuring a JDBC source.")
-                return False
-        else:
-            print("Invalid choice. Enter 1, 2, or 3.")
-
-
 def config_display_path(active: Path, root: Path | None = None) -> str:
     if root is not None:
         try:
@@ -2193,8 +2165,6 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         print("Each stage explains the field and where its value is used.")
         print("Values between brackets are default/example values.")
         print("Press Enter to accept the displayed default/example value.")
-        if not ask_data_preparation_flow():
-            return False
         if not ask_existing_config_file(active, config_ref):
             return False
 
@@ -2231,7 +2201,7 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         )
 
     print("\n" + "=" * 72)
-    print("Stage 2/4 — Source tables, columns, and migration jobs")
+    print("Stage 2/4 — Source tables, columns, and layers")
     print("=" * 72)
     theme_count = ask_int_field(
         "Number of theme KPIs (0-4)", config["installation"]["kpis"]["theme_count"],
@@ -2259,10 +2229,10 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
             (
                 "source_table",
                 "primary_key",
+                "territory_level_3_column",
                 "geometry_column",
                 "created_at_column",
                 "updated_at_column",
-                "territory_level_3_column",
                 "area_column",
             ),
         ),
@@ -2327,36 +2297,14 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
             else:
                 aoi_section["business_only_persist_columns"] = []
         config["etl"][name]["where_clause"] = ask_field(
-            "where-clause", config["etl"][name]["where_clause"],
+            "where_clause", config["etl"][name]["where_clause"],
             "Optional SQL filter applied while reading this entity.",
             "the ETL source query",
         )
 
-    for name in ("level1", "level2", "level3", "area_of_interest"):
-        config["etl"]["jobs"][name] = ask_bool_field(
-            f"Run {name} job", config["etl"]["jobs"][name],
-            "Whether this entity should be loaded during migration.",
-            "the ETL execution plan",
-        )
-    config["etl"]["jobs"]["layer_jobs"] = ask_bool_field(
-        "Run generic layer jobs",
-        bool(config["etl"]["jobs"].get("layer_jobs", True)),
-        "Whether extra layers (etl.layers) should be migrated and published.",
-        "the ETL execution plan",
-    )
-    if config["etl"]["jobs"]["layer_jobs"]:
-        ask_generic_layers(config)
-        if not config["etl"].get("layers"):
-            print("\n  Note: no generic layer declared; the layer jobs have nothing to migrate.")
-    else:
-        declared = len(config["etl"].get("layers") or [])
-        if declared:
-            print(
-                f"\n  Note: {declared} generic layer(s) stay declared in etl.layers "
-                "but will not be migrated while layer jobs are disabled."
-            )
+    ask_generic_layers(config)
     print(
-        "\n  Note: enabled generic layers are also published as download themes "
+        "\n  Note: configured generic layers are migrated and published as download themes "
         "in downloadThemesConfig.json."
     )
 
@@ -2472,6 +2420,10 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         )
 
     ask_about_page(config, example.parent.parent / "about")
+
+    etl = config.get("etl")
+    if isinstance(etl, dict):
+        etl.pop("jobs", None)
 
     write_adopter_config(active, config, template)
     print(f"\nConfiguration saved to {active}")
@@ -2827,6 +2779,9 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         raise ValueError("theme_count must be an integer between 0 and 4.")
     config_changed = reset_disabled_themes(values, template, theme_count)
     config_changed = sync_map_layer_names(values) or config_changed
+    etl = values.get("etl")
+    if isinstance(etl, dict) and etl.pop("jobs", None) is not None:
+        config_changed = True
     if config_changed:
         write_adopter_config(active, values, template)
     source_values = []
@@ -3043,16 +2998,11 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         source_reason="duplicates a required or additional column mapping.",
     )
     migration["batch"]["layers"] = build_batch_layers(extra_layers)
-    jobs = etl.get("jobs", {})
-    job_names = {
-        "level1": "admin-unit-level-1-geoserver-job",
-        "level2": "admin-unit-level-2-geoserver-job",
-        "level3": "admin-unit-level-3-geoserver-job",
-        "area_of_interest": "area-of-interest-geoserver-job",
-    }
-    for name, target in job_names.items():
-        migration["execution-jobs"][target] = bool(jobs.get(name, True))
-    layer_jobs_enabled = bool(jobs.get("layer_jobs", bool(extra_layers)))
+    migration["execution-jobs"]["admin-unit-level-1-geoserver-job"] = True
+    migration["execution-jobs"]["admin-unit-level-2-geoserver-job"] = True
+    migration["execution-jobs"]["admin-unit-level-3-geoserver-job"] = True
+    migration["execution-jobs"]["area-of-interest-geoserver-job"] = True
+    layer_jobs_enabled = bool(extra_layers)
     migration["execution-jobs"]["layer-jobs"] = layer_jobs_enabled
     output = root / "config/Job-Data-Migration/application/application.yaml"
     output.write_text(dump_yaml(migration), encoding="utf-8")
@@ -3062,7 +3012,7 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     if not quiet:
         print("Configuration files generated successfully.")
         if extra_layers:
-            print(f"  Generic layers: {len(extra_layers)} (layer-jobs={layer_jobs_enabled})")
+            print(f"  Generic layers: {len(extra_layers)}")
         print(f"  Download themes: {len(download_themes.get('themes', []))}")
         if storage["endpoint"]:
             print(
@@ -3076,7 +3026,7 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         print(
             "  2. For SQL subqueries, keep source_table in a YAML folded block (>-)"
         )
-        print("  3. Run ./setup.sh and choose option 2 (migrate) or 3 (no migration).")
+        print("  3. Run ./setup.sh and choose Real adopter.")
         print("  4. Run ./start.sh to start the application.")
 
 def main() -> None:

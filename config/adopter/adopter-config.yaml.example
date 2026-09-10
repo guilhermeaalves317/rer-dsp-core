@@ -3,7 +3,7 @@
 # This is the only file to edit in the advanced workflow.
 # DSP contract keys are kept by the core templates.
 # To fill in this file step by step, run: ./config.sh
-# Wizard order: 1 database, 2 tables/jobs, 3 application, 4 interface.
+# Wizard order: 1 database, 2 tables/layers, 3 application, 4 interface.
 # Quote strings only when YAML requires it (special characters). Numbers, booleans and null are not quoted.
 
 environment:
@@ -84,10 +84,10 @@ etl:
   area_of_interest:
     source_table: "<source_schema>.<source_table>"
     primary_key: "<source_pk>"
+    territory_level_3_column: "<source_territory_level_3_fk>"
     geometry_column: "<source_geom>"
     created_at_column: "<source_created_at>"
     updated_at_column: "<source_updated_at>"           # optional column
-    territory_level_3_column: "<source_territory_level_3_fk>"
     area_column: "<source_area>"
     business_only_persist_columns:
       - "theme_1"
@@ -106,12 +106,12 @@ etl:
   #
   #   layers:
   #     - source_table: "<schema>.<table>"   # origin schema (e.g. public) — never dsp
-  #       parent_key: "<source_parent_pk>"   # AOI FK (e.g. aeroporto_id)
   #       primary_key: "<source_pk>"
-  #       created_at_column: "<source_created_at>"
-  #       updated_at_column: "<source_updated_at>"      # optional column
+  #       parent_key: "<source_parent_pk>"   # AOI FK (e.g. aeroporto_id)
   #       label_column: "<source_name>"                 # optional column
   #       geometry_column: "<source_geom>"
+  #       created_at_column: "<source_created_at>"
+  #       updated_at_column: "<source_updated_at>"      # optional column
   #       additional_columns: []
   #       layer_name: "<wms_id>"             # technical id; destination = dsp.<name> 
   #       srid: 4326
@@ -122,12 +122,6 @@ etl:
   #       color: "#2563EB"
   #       fill_color: "transparent"
   layers: []
-  jobs:
-    level1: true
-    level2: true
-    level3: true
-    area_of_interest: true
-    layer_jobs: true
 
   parallelization:
     level1:

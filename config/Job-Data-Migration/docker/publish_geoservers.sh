@@ -1,6 +1,6 @@
 #!/bin/sh
-# After option 3's first successful migration: publish layers on both GeoServers.
-# No-op when DSP_MIGRATION_SCHEDULED_AT is empty (option 2 already populated in setup).
+# After the first successful scheduled migration: publish layers on both GeoServers.
+# No-op when DSP_MIGRATION_SCHEDULED_AT is empty (Run now already populated GeoServer during setup).
 set -e
 
 MARKER="${DSP_GEOSERVER_POPULATE_MARKER:-/tmp/dsp-geoserver-populated.done}"
