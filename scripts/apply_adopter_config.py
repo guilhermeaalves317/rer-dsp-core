@@ -23,7 +23,7 @@ except ImportError:
     termios = None
     tty = None
 
-# URLs consumidas pelo browser, portanto passam pelo gateway (DSP_PUBLIC_BASE_URL no .env).
+# URLs consumed by the browser, so they go through the gateway (DSP_PUBLIC_BASE_URL in .env).
 PUBLIC_BASE_URL = os.environ.get("DSP_PUBLIC_BASE_URL", "http://localhost:8026").rstrip("/")
 FIXED_WMS_BASE_URL = f"{PUBLIC_BASE_URL}/geoserver-exhibition/dsp/wms"
 # Downloads use GeoServer Download (separate from map Exhibition WMS).
@@ -40,6 +40,41 @@ FIXED_LAYER_IDS = {
     "dsp:territory-level-2",
     "dsp:territory-level-3",
     "dsp:area-of-interest",
+}
+# Target column names reserved for layers (same as LayerConfig.CANONICAL_TARGET_COLUMNS).
+LAYER_CANONICAL_TARGET_COLUMNS = (
+    "id",
+    "area_of_interest_id",
+    "created_at",
+    "updated_at",
+    "label",
+    "geom",
+)
+# Target column names reserved for AOI (same as AreaOfInterestConfig.CANONICAL_TARGET_COLUMNS).
+AOI_CANONICAL_TARGET_COLUMNS = (
+    "id",
+    "created_at",
+    "updated_at",
+    "territory_level_3_id",
+    "area",
+    "geom",
+)
+# Defaults of environment.object_storage, used when the block is absent from an
+# adopter-config.yaml written before the pre-generation feature existed.
+OBJECT_STORAGE_DEFAULTS = {
+    "endpoint": "",
+    "region": "us-east-1",
+    "bucket": "dsp-geo-files",
+    "access_key": "",
+    "secret_key": "",
+    "path_style_access": True,
+    "generation_cron": "0 2 * * *",
+}
+RESERVED_DESTINATION_TABLES = {
+    "territory_level_1",
+    "territory_level_2",
+    "territory_level_3",
+    "area_of_interest",
 }
 CANONICAL_AOI_DETAIL_FIELDS = (
     "id",
@@ -470,6 +505,9 @@ def etl_field_help(field: str) -> str:
         ),
         "primary_key": "Unique source column used to identify each record.",
         "parent_key": "Source column linking this record to its parent territory.",
+        "layer_parent_key": (
+            "Source column linking this feature to its area of interest (AOI)."
+        ),
         "name_column": "Source column containing the display name.",
         "geometry_column": "Source column containing the geometry.",
         "created_at_column": "Source column containing the creation timestamp.",
@@ -478,7 +516,6 @@ def etl_field_help(field: str) -> str:
         ),
         "label_column": (
             "Source column with the feature display name (optional). "
-            "Copied to the destination as 'label'."
         ),
         "territory_level_3_column": "Source column linking an area to territorial level 3.",
         "area_column": "Source column containing the area measurement.",
@@ -703,6 +740,56 @@ def parse_column_list(raw: Any, prefix: str) -> list[str]:
     return unique
 
 
+def columns_clashing_with(
+    columns: list[str],
+    blocked: Any,
+    *,
+    ignore_case: bool = False,
+) -> list[str]:
+    """Return columns from `columns` that are already in the blocked set, in original order."""
+    if ignore_case:
+        blocked_lower = {str(name).lower() for name in blocked if name}
+        return [column for column in columns if column.lower() in blocked_lower]
+    blocked_set = set(blocked)
+    return [column for column in columns if column in blocked_set]
+
+
+def canonical_target_clash_reason(target_names: Any) -> str:
+    listed = ", ".join(sorted(target_names))
+    return f"collides with a canonical target column name [{listed}]."
+
+
+def reject_clashing_columns(
+    columns: list[str],
+    blocked: Any,
+    prefix: str,
+    *,
+    reason: str = "duplicates a required column mapping.",
+    ignore_case: bool = False,
+) -> None:
+    for column in columns_clashing_with(columns, blocked, ignore_case=ignore_case):
+        raise ValueError(f"{prefix} entry '{column}' {reason}")
+
+
+def reject_source_and_target_clashes(
+    columns: list[str],
+    source_blocked: Any,
+    target_blocked: Any,
+    prefix: str,
+    *,
+    target_ignore_case: bool = False,
+    source_reason: str = "duplicates a required column mapping.",
+) -> None:
+    reject_clashing_columns(columns, source_blocked, prefix, reason=source_reason)
+    reject_clashing_columns(
+        columns,
+        target_blocked,
+        prefix,
+        reason=canonical_target_clash_reason(target_blocked),
+        ignore_case=target_ignore_case,
+    )
+
+
 def ask_optional_column_list(label: str, default: Any, description: str, used_in: str) -> list[str]:
     if isinstance(default, list):
         default_display = ", ".join(default)
@@ -727,6 +814,72 @@ def ask_optional_column_list(label: str, default: Any, description: str, used_in
             return parse_column_list(text, label)
         except ValueError as exc:
             print(f"\n  {exc}")
+
+
+def _without_source_or_target(
+    columns: list[str],
+    source_blocked: Any,
+    target_blocked: Any,
+    *,
+    target_ignore_case: bool = False,
+) -> list[str]:
+    source_set = {name for name in source_blocked if name}
+    return [
+        column
+        for column in columns
+        if column not in source_set
+        and not columns_clashing_with(
+            [column], target_blocked, ignore_case=target_ignore_case
+        )
+    ]
+
+
+def ask_unblocked_column_list(
+    label: str,
+    default: Any,
+    description: str,
+    used_in: str,
+    blocked: Any,
+    prefix: str,
+    *,
+    clash_reason: str = "duplicates a required column mapping.",
+    target_blocked: Any = (),
+    target_ignore_case: bool = False,
+) -> list[str]:
+    """Prompt for a column list and reject names already mapped or reserved on the target side."""
+    source_set = {name for name in blocked if name}
+    try:
+        suggested = _without_source_or_target(
+            parse_column_list(default or [], prefix),
+            source_set,
+            target_blocked,
+            target_ignore_case=target_ignore_case,
+        )
+    except ValueError:
+        suggested = []
+    while True:
+        selected = ask_optional_column_list(label, suggested, description, used_in)
+        source_clash = columns_clashing_with(selected, source_set)
+        if source_clash:
+            print(f"\n  Already mapped (do not list again): {', '.join(source_clash)}")
+            if clash_reason:
+                print(f"  {prefix} entry '{source_clash[0]}' {clash_reason}")
+            suggested = _without_source_or_target(
+                selected, source_set, target_blocked, target_ignore_case=target_ignore_case
+            )
+            continue
+        target_clash = columns_clashing_with(
+            selected, target_blocked, ignore_case=target_ignore_case
+        )
+        if target_clash:
+            reason = canonical_target_clash_reason(target_blocked)
+            print(f"\n  Reserved destination name (do not list): {', '.join(target_clash)}")
+            print(f"  {prefix} entry '{target_clash[0]}' {reason}")
+            suggested = _without_source_or_target(
+                selected, source_set, target_blocked, target_ignore_case=target_ignore_case
+            )
+            continue
+        return selected
 
 
 def require_non_blank_column(value: Any, prefix: str) -> str:
@@ -1078,9 +1231,6 @@ def is_source_table_placeholder(source_table: str) -> bool:
 
 
 def is_territory_level_etl_configured(values: dict[str, Any], level: str) -> bool:
-    jobs = get(values, "etl", "jobs", default={}) or {}
-    if jobs.get(level) is False:
-        return False
     source_table = str(get(values, "etl", level, "source_table", default=""))
     return not is_source_table_placeholder(source_table)
 
@@ -1099,7 +1249,7 @@ def is_territorial_bbox_viable(values: dict[str, Any]) -> bool:
 
 TERRITORIAL_BBOX_PLANET_REASON = (
     "Territorial geometry cannot be resolved from the ETL configuration "
-    "(no enabled level1/level2/level3 source table)."
+    "(no configured level1/level2/level3 source table)."
 )
 
 
@@ -1346,24 +1496,26 @@ def sync_map_layer_names(config: dict[str, Any]) -> bool:
     return changed
 
 
+def split_schema_table(source_table: str) -> tuple[str, str]:
+    """Split schema.table (exactly one '.'), matching the job QualifiedTable contract."""
+    qualified = str(source_table).strip()
+    parts = qualified.split(".")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError(
+            f"source_table must be schema.table with exactly one '.' "
+            f"(got {source_table!r})."
+        )
+    return parts[0].strip(), parts[1].strip()
+
+
 def table_name_from_source(source_table: str) -> str:
     """Return the unqualified table name (schema discarded), matching the job contract."""
-    qualified = str(source_table).strip()
-    if "." not in qualified:
-        raise ValueError(
-            f"etl.layers source_table must be schema.table (got {source_table!r})."
-        )
-    return qualified.rsplit(".", 1)[-1].strip()
+    return split_schema_table(source_table)[1]
 
 
 def source_schema_from_table(source_table: str) -> str:
     """Return the schema part of schema.table."""
-    qualified = str(source_table).strip()
-    if "." not in qualified:
-        raise ValueError(
-            f"etl.layers source_table must be schema.table (got {source_table!r})."
-        )
-    return qualified.rsplit(".", 1)[0].strip()
+    return split_schema_table(source_table)[0]
 
 
 def validate_layer_name(layer_name: str, prefix: str = "layer_name") -> str:
@@ -1385,7 +1537,7 @@ def validate_source_table_schema(source_table: str, prefix: str) -> None:
         table = table_name_from_source(source_table)
         raise ValueError(
             f"{prefix}.source_table must use the origin schema, not '{DESTINATION_SCHEMA}'. "
-            f"The job migrates schema.table → {DESTINATION_SCHEMA}.{table}. "
+            f"The job writes extra layers into '{DESTINATION_SCHEMA}' on geo-target. "
             f"Example: public.{table}"
         )
 
@@ -1395,6 +1547,11 @@ def resolve_layer_name(entry: dict[str, Any]) -> str:
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     return table_name_from_source(entry["source_table"])
+
+
+def physical_table_name(layer_name: str) -> str:
+    """Physical table id: WMS may use hyphens; the table uses underscores."""
+    return layer_name.replace("-", "_")
 
 
 def normalize_epsg(srid: Any) -> str:
@@ -1417,6 +1574,69 @@ def resolve_layer_parent_key(entry: dict[str, Any]) -> str | None:
     return None
 
 
+def _source_column_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or name.lower() == "null" or "<" in name:
+        return None
+    return name
+
+
+def _unique_column_names(values: list[Any]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = _source_column_name(value)
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def layer_canonical_source_columns(entry: dict[str, Any]) -> list[str]:
+    """Source columns already mapped in the layer's required fields."""
+    return _unique_column_names(
+        [
+            entry.get("primary_key"),
+            resolve_layer_parent_key(entry),
+            entry.get("created_at_column"),
+            entry.get("geometry_column"),
+            entry.get("updated_at_column"),
+            entry.get("label_column"),
+        ]
+    )
+
+
+def aoi_canonical_source_columns(aoi: dict[str, Any]) -> list[str]:
+    """Source columns already mapped in the AOI's required fields."""
+    return _unique_column_names(
+        [
+            aoi.get("primary_key"),
+            aoi.get("created_at_column"),
+            aoi.get("territory_level_3_column"),
+            aoi.get("area_column"),
+            aoi.get("geometry_column"),
+            aoi.get("updated_at_column"),
+        ]
+    )
+
+
+def ask_layer_additional_columns(entry: dict[str, Any]) -> list[str]:
+    """Prompt for layer additional_columns and reject names already mapped or reserved on the target side."""
+    return ask_unblocked_column_list(
+        "Extra columns to migrate",
+        entry.get("additional_columns") or [],
+        etl_field_help("additional_columns"),
+        "the ETL job mapping for this layer",
+        layer_canonical_source_columns(entry),
+        "additional_columns",
+        target_blocked=LAYER_CANONICAL_TARGET_COLUMNS,
+        target_ignore_case=True,
+    )
+
+
 def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate and normalize etl.layers entries."""
     raw_layers = get(values, "etl", "layers", default=[])
@@ -1426,7 +1646,7 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("etl.layers must be a list.")
 
     seen_tables: set[str] = set()
-    seen_wms: set[str] = set(FIXED_LAYER_IDS)
+    seen_wms: set[str] = set()
     validated: list[dict[str, Any]] = []
 
     for index, entry in enumerate(raw_layers):
@@ -1450,16 +1670,18 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
         if not aoi_column:
             raise ValueError(f"{prefix}.parent_key is required.")
 
-        table = table_name_from_source(source_table)
-        if table in seen_tables:
-            raise ValueError(
-                f"{prefix}: duplicate target table dsp.{table} "
-                "(two source tables must not share the same table name)."
-            )
-        seen_tables.add(table)
-
         layer_name = validate_layer_name(resolve_layer_name(entry), f"{prefix}.layer_name")
+        table = physical_table_name(layer_name)
         wms_id = f"dsp:{layer_name}"
+        if wms_id in FIXED_LAYER_IDS:
+            raise ValueError(f"{prefix}: WMS id {wms_id} collides with another layer.")
+        if table in RESERVED_DESTINATION_TABLES:
+            raise ValueError(
+                f"{prefix}: target table dsp.{table} is reserved for a fixed migration."
+            )
+        if table in seen_tables:
+            raise ValueError(f"{prefix}: duplicate target table dsp.{table}.")
+        seen_tables.add(table)
         if wms_id in seen_wms:
             raise ValueError(f"{prefix}: WMS id {wms_id} collides with another layer.")
         seen_wms.add(wms_id)
@@ -1512,21 +1734,13 @@ def validate_extra_layers(values: dict[str, Any]) -> list[dict[str, Any]]:
             entry.get("additional_columns"),
             f"{prefix}.additional_columns",
         )
-        canonical = {
-            normalized["primary_key"],
-            aoi_column.strip(),
-            normalized["created_at_column"],
-            normalized["geometry_column"],
-        }
-        if normalized["updated_at_column"]:
-            canonical.add(normalized["updated_at_column"])
-        if normalized["label_column"]:
-            canonical.add(normalized["label_column"])
-        for column in extras:
-            if column in canonical:
-                raise ValueError(
-                    f"{prefix}.additional_columns entry '{column}' duplicates a required column mapping."
-                )
+        reject_source_and_target_clashes(
+            extras,
+            layer_canonical_source_columns(entry),
+            LAYER_CANONICAL_TARGET_COLUMNS,
+            f"{prefix}.additional_columns",
+            target_ignore_case=True,
+        )
         if extras:
             normalized["additional_columns"] = extras
         validated.append(normalized)
@@ -1883,9 +2097,71 @@ def ask_screen_text_fields(screens: dict[str, Any]) -> None:
     )
 
 
+# Source structure fields. Can be reused as default
+# when another layer of the same source_table is configured in this wizard.
+SOURCE_STRUCTURE_FIELDS = (
+    "parent_key",
+    "primary_key",
+    "created_at_column",
+    "updated_at_column",
+    "label_column",
+    "geometry_column",
+    "additional_columns",
+    "srid",
+)
+
+
+def snapshot_source_structure(entry: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the source structure fields (wizard memory)."""
+    snapshot: dict[str, Any] = {}
+    for field in SOURCE_STRUCTURE_FIELDS:
+        if field in entry:
+            snapshot[field] = copy.deepcopy(entry[field])
+    return snapshot
+
+
+def remember_source_structure(
+    memory: dict[str, dict[str, Any]],
+    entry: dict[str, Any],
+) -> None:
+    """Remember the last structure mapping for this layer's source_table."""
+    source_table = str(entry.get("source_table") or "").strip()
+    if not source_table:
+        return
+    memory[source_table] = snapshot_source_structure(entry)
+
+
+def lookup_source_structure(
+    memory: dict[str, dict[str, Any]] | None,
+    source_table: str,
+) -> dict[str, Any]:
+    """Return the last mapping for this source in this execution, or empty."""
+    if not memory:
+        return {}
+    previous = memory.get(source_table)
+    return copy.deepcopy(previous) if previous else {}
+
+
+def apply_source_structure_defaults(
+    entry: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> None:
+    """Fill empty structure fields with the last mapping from the source."""
+    if not previous:
+        return
+    for field in SOURCE_STRUCTURE_FIELDS:
+        current = entry.get(field)
+        if current not in (None, ""):
+            continue
+        if field not in previous:
+            continue
+        entry[field] = copy.deepcopy(previous[field])
+
+
 def ask_generic_layer_entry(
     config: dict[str, Any],
     entry: dict[str, Any] | None,
+    source_structure_by_table: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Ask every field of one generic layer (migration + map presentation)."""
     entry = copy.deepcopy(entry) if entry else {}
@@ -1894,44 +2170,47 @@ def ask_generic_layer_entry(
         default_source = entry.get("source_table") or "public.my_layer"
         source_table = str(
             ask_field(
-                "Source table", default_source,
-                "Origin table (schema.table). Destination is always dsp.<table> — do not use schema 'dsp'.",
-                "the migration job (reads from your source database)",
+                "source_table", default_source,
+                etl_field_help("source_table"),
+                "the migration job mapping for this layer",
             )
         ).strip()
-        if "." not in source_table or "<" in source_table:
+        if "<" in source_table:
             print("\n  Enter the origin table as schema.table (e.g. public.my_layer).")
             continue
         try:
+            split_schema_table(source_table)
             validate_source_table_schema(source_table, "etl.layers")
         except ValueError as exc:
             print(f"\n  {exc}")
             continue
         break
     entry["source_table"] = source_table
+    apply_source_structure_defaults(
+        entry,
+        lookup_source_structure(source_structure_by_table, source_table),
+    )
 
-    while True:
-        aoi_column = str(
-            ask_field(
-                "parent_key",
-                resolve_layer_parent_key(entry) or "",
-                etl_field_help("parent_key"),
-                "the ETL job mapping for this entity",
-            )
-        ).strip()
-        if aoi_column and "<" not in aoi_column:
-            break
-        print("\n  Enter the source column name.")
-    entry["parent_key"] = aoi_column
-
-    for field in ("primary_key", "created_at_column", "updated_at_column", "label_column", "geometry_column"):
+    for field in (
+        "primary_key",
+        "parent_key",
+        "label_column",
+        "geometry_column",
+        "created_at_column",
+        "updated_at_column",
+    ):
+        field_help = (
+            etl_field_help("layer_parent_key")
+            if field == "parent_key"
+            else etl_field_help(field)
+        )
         if field in ("updated_at_column", "label_column"):
             while True:
                 value = ask_optional_field(
                     field,
                     entry.get(field) or "",
-                    etl_field_help(field),
-                    "the ETL job mapping for this layer",
+                    field_help,
+                    "the migration job mapping for this layer",
                 )
                 if value is None or ("<" not in value):
                     entry[field] = value
@@ -1943,8 +2222,8 @@ def ask_generic_layer_entry(
                 ask_field(
                     field,
                     entry.get(field) or "",
-                    etl_field_help(field),
-                    "the ETL job mapping for this layer",
+                    field_help,
+                    "the migration job mapping for this layer",
                 )
             ).strip()
             if value and "<" not in value:
@@ -1952,24 +2231,20 @@ def ask_generic_layer_entry(
                 break
             print("\n  Enter the source column name.")
 
-    entry["additional_columns"] = ask_optional_column_list(
-        "Extra columns to migrate",
-        entry.get("additional_columns") or [],
-        etl_field_help("additional_columns"),
-        "the ETL job mapping for this layer",
-    )
+    entry["additional_columns"] = ask_layer_additional_columns(entry)
     entry["where_clause"] = ask_field(
-        "where-clause", entry.get("where_clause", "1=1"),
+        "where_clause", entry.get("where_clause", "1=1"),
         "Optional SQL filter applied while reading this layer.",
         "the ETL source query",
     )
 
-    default_layer_name = entry.get("layer_name") or source_table.rsplit(".", 1)[-1]
+    default_layer_name = entry.get("layer_name") or table_name_from_source(source_table)
     while True:
         raw_name = str(
             ask_field(
                 "Layer name", default_layer_name,
-                "Technical WMS id (lowercase, digits, hyphens, underscores). Published as dsp:<name>.",
+                "Technical WMS id (lowercase, digits, hyphens, underscores). "
+                "Published as dsp:<name>; physical table is dsp.<name> with hyphens as underscores.",
                 "GeoServer and the map layer selector",
             )
         ).strip()
@@ -2044,9 +2319,10 @@ def ask_generic_layers(config: dict[str, Any]) -> None:
     etl = config["etl"]
     declared = list(etl.get("layers") or [])
     result: list[dict[str, Any]] = []
+    source_structure_by_table: dict[str, dict[str, Any]] = {}
 
     print("\n  Generic layers")
-    print("  What: extra source tables migrated to dsp.<table> and published as WMS layers.")
+    print("  What: extra source tables migrated to dsp.<layer_name> and published as WMS layers.")
     print("  Used in: the migration job, GeoServer publishing, and the map layer selector")
 
     for item in declared:
@@ -2056,39 +2332,43 @@ def ask_generic_layers(config: dict[str, Any]) -> None:
         if not ask_bool("  Keep this layer", True):
             continue
         if ask_bool("  Edit this layer", False):
-            item = ask_generic_layer_entry(config, item)
+            item = ask_generic_layer_entry(config, item, source_structure_by_table)
+        else:
+            blocked = layer_canonical_source_columns(item)
+            try:
+                extras = parse_column_list(
+                    item.get("additional_columns") or [], "additional_columns"
+                )
+                needs_fix = bool(columns_clashing_with(extras, blocked)) or bool(
+                    columns_clashing_with(
+                        extras, LAYER_CANONICAL_TARGET_COLUMNS, ignore_case=True
+                    )
+                )
+            except ValueError:
+                needs_fix = True
+            if needs_fix:
+                print(
+                    "\n  additional_columns lists columns already mapped or reserved "
+                    "on the destination for this layer."
+                )
+                print(f"  Already mapped: {', '.join(blocked)}")
+                print(
+                    "  Reserved destination: "
+                    f"{', '.join(LAYER_CANONICAL_TARGET_COLUMNS)}"
+                )
+                item = copy.deepcopy(item)
+                item["additional_columns"] = ask_layer_additional_columns(item)
         result.append(item)
+        remember_source_structure(source_structure_by_table, item)
 
     add_next = not result
     while ask_bool("\n  Add a generic layer" if not result else "\n  Add another generic layer", add_next):
-        result.append(ask_generic_layer_entry(config, None))
+        item = ask_generic_layer_entry(config, None, source_structure_by_table)
+        result.append(item)
+        remember_source_structure(source_structure_by_table, item)
         add_next = False
 
     etl["layers"] = result
-
-
-def ask_data_preparation_flow() -> bool:
-    print("\nBefore configuring a JDBC source, choose the data preparation flow:")
-    print("  1. Demonstration (built-in seed, no JDBC source or migration job)")
-    print("  2. Real adopter — migrate from JDBC source (ETL)")
-    print("  3. Real adopter — no migration (empty DBs, UI/GeoServer config only)")
-
-    while True:
-        choice = ask("Choice", "2")
-        if choice == "2":
-            return True
-        if choice == "1":
-            if ask_bool("Use the demonstration flow instead", True):
-                print("\nRun ./setup.sh and choose option 1 (Demonstration).")
-                print("This wizard will now exit without configuring a JDBC source.")
-                return False
-        elif choice == "3":
-            if ask_bool("Use the empty-database flow instead", True):
-                print("\nRun ./setup.sh and choose option 3 (Real adopter — no migration).")
-                print("This wizard will now exit without configuring a JDBC source.")
-                return False
-        else:
-            print("Invalid choice. Enter 1, 2, or 3.")
 
 
 def config_display_path(active: Path, root: Path | None = None) -> str:
@@ -2143,8 +2423,6 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         print("Each stage explains the field and where its value is used.")
         print("Values between brackets are default/example values.")
         print("Press Enter to accept the displayed default/example value.")
-        if not ask_data_preparation_flow():
-            return False
         if not ask_existing_config_file(active, config_ref):
             return False
 
@@ -2169,7 +2447,7 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
     )
 
     print("\n" + "=" * 72)
-    print("Stage 2/5 — Source tables, columns, and migration jobs")
+    print("Stage 2/5 — Source tables, columns and layers ")
     print("=" * 72)
     for name, fields in (
         ("level1", ("source_table", "primary_key", "name_column", "geometry_column", "created_at_column", "updated_at_column")),
@@ -2215,43 +2493,25 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
                 ask_entity_layer_srid(config, srs_key, srs_label)
         if name == "area_of_interest":
             config["etl"][name]["area_column"] = FIXED_AOI_AREA_COLUMN
+            aoi_section = config["etl"][name]
             config["etl"][name]["additional_columns"] = ask_optional_column_list(
                 "Extra columns to migrate",
-                config["etl"][name].get("additional_columns") or [],
+                aoi_section.get("additional_columns") or [],
                 etl_field_help("additional_columns"),
                 "the ETL job mapping for this entity",
+                additional_blocked,
+                "etl.area_of_interest.additional_columns",
+                target_blocked=AOI_CANONICAL_TARGET_COLUMNS,
             )
         config["etl"][name]["where_clause"] = ask_field(
-            "where-clause", config["etl"][name]["where_clause"],
+            "where_clause", config["etl"][name]["where_clause"],
             "Optional SQL filter applied while reading this entity.",
             "the ETL source query",
         )
 
-    for name in ("level1", "level2", "level3", "area_of_interest"):
-        config["etl"]["jobs"][name] = ask_bool_field(
-            f"Run {name} job", config["etl"]["jobs"][name],
-            "Whether this entity should be loaded during migration.",
-            "the ETL execution plan",
-        )
-    config["etl"]["jobs"]["layer_jobs"] = ask_bool_field(
-        "Run generic layer jobs",
-        bool(config["etl"]["jobs"].get("layer_jobs", True)),
-        "Whether extra layers (etl.layers) should be migrated and published.",
-        "the ETL execution plan",
-    )
-    if config["etl"]["jobs"]["layer_jobs"]:
-        ask_generic_layers(config)
-        if not config["etl"].get("layers"):
-            print("\n  Note: no generic layer declared; the layer jobs have nothing to migrate.")
-    else:
-        declared = len(config["etl"].get("layers") or [])
-        if declared:
-            print(
-                f"\n  Note: {declared} generic layer(s) stay declared in etl.layers "
-                "but will not be migrated while layer jobs are disabled."
-            )
+    ask_generic_layers(config)
     print(
-        "\n  Note: enabled generic layers are also published as download themes "
+        "\n  Note: configured generic layers are migrated and published as download themes "
         "in downloadThemesConfig.json."
     )
 
@@ -2277,6 +2537,7 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         "Pattern for dates with time (e.g. dd/MM/yyyy HH:mm).",
         "detail screens",
     )
+    ask_object_storage(config)
 
     print("\n" + "=" * 72)
     print("Stage 4/5 — Interface")
@@ -2349,9 +2610,73 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
 
     ensure_fixed_aoi_area_column(config)
     sync_aoi_area_unit_installation(config)
+    etl = config.get("etl")
+    if isinstance(etl, dict):
+        etl.pop("jobs", None)
+
     write_adopter_config(active, config, template)
     print(f"\nConfiguration saved to {active}")
     return True
+
+
+def ask_object_storage(config: dict[str, Any]) -> None:
+    """Collects the object storage credentials for the pre-generated download files.
+
+    The whole block is optional: without an endpoint the pre-generation job stays off and
+    downloads keep going straight to the WFS, which is the behaviour before this feature.
+    """
+    storage = config["environment"].setdefault(
+        "object_storage", copy.deepcopy(OBJECT_STORAGE_DEFAULTS)
+    )
+    print("\nObject storage for pre-generated download files (optional)")
+    print("  Leave the endpoint empty to keep serving downloads from the WFS only.")
+    storage["endpoint"] = ask_optional_field(
+        "Object storage endpoint (S3 API)",
+        storage.get("endpoint") or "",
+        "Address of the S3-compatible API. Empty disables the pre-generation job.",
+        "the geo file generation job and the backend",
+    ) or ""
+    if not storage["endpoint"]:
+        print("  Pre-generation disabled: downloads keep using the WFS.")
+        return
+    storage["bucket"] = ask_field(
+        "Bucket", storage.get("bucket") or OBJECT_STORAGE_DEFAULTS["bucket"],
+        "Bucket where the files are published. It must already exist — the job never creates it.",
+        "the geo file generation job and the backend",
+    )
+    storage["region"] = ask_field(
+        "Region", storage.get("region") or OBJECT_STORAGE_DEFAULTS["region"],
+        "Region reported to the S3 API. Endpoints that ignore it accept any value.",
+        "the geo file generation job and the backend",
+    )
+    storage["access_key"] = ask_field(
+        "Access key", storage.get("access_key") or "",
+        "Credential with write access for the job and read access for the backend.",
+        "the geo file generation job, the backend and .env",
+    )
+    storage["secret_key"] = ask_field(
+        "Secret key", storage.get("secret_key") or "",
+        "Secret paired with the access key.",
+        "the geo file generation job, the backend and .env",
+    )
+    storage["path_style_access"] = ask_bool_field(
+        "Path-style access",
+        bool(storage.get("path_style_access", True)),
+        "Keeps the bucket in the path instead of the host name. Endpoints that are not "
+        "AWS usually need it on.",
+        "the S3 client of the job and the backend",
+    )
+    while True:
+        cron = ask_field(
+            "Pre-generation cron",
+            storage.get("generation_cron") or OBJECT_STORAGE_DEFAULTS["generation_cron"],
+            "Schedule of the geo file job, in a window after the migration (5 fields).",
+            "the dsp-job-geo-file-generation service",
+        )
+        if len(str(cron).split()) == 5:
+            storage["generation_cron"] = str(cron)
+            break
+        print("\n  The cron needs 5 fields (minute hour day month weekday).")
 
 
 def ask_about_page(config: dict[str, Any], about_dir: Path) -> None:
@@ -2470,6 +2795,21 @@ def replace_env(env_file: Path, values: dict[str, Any]) -> None:
     srs = get(values, "environment", "layer_srs", default={})
     for name, value in srs.items():
         replacements[f"LAYER_SRS_{name.upper()}"] = value
+    storage = object_storage_settings(values)
+    replacements.update(
+        {
+            "DSP_OBJECT_STORAGE_ENDPOINT": storage["endpoint"],
+            "DSP_OBJECT_STORAGE_REGION": storage["region"],
+            "DSP_OBJECT_STORAGE_BUCKET": storage["bucket"],
+            "DSP_OBJECT_STORAGE_ACCESS_KEY": storage["access_key"],
+            "DSP_OBJECT_STORAGE_SECRET_KEY": storage["secret_key"],
+            "DSP_OBJECT_STORAGE_PATH_STYLE_ACCESS": str(
+                bool(storage["path_style_access"])
+            ).lower(),
+            # Quoted because the value carries spaces, like DSP_MIGRATION_CRON.
+            "DSP_GEO_FILE_GENERATION_CRON": f"\"{storage['generation_cron']}\"",
+        }
+    )
     result = []
     seen = set()
     for line in lines:
@@ -2544,6 +2884,32 @@ def set_source_mapping(section: dict[str, Any], values: dict[str, Any]) -> None:
     section.pop("change-detection-strategy", None)
 
 
+def object_storage_settings(values: dict[str, Any]) -> dict[str, Any]:
+    """Reads environment.object_storage, filling in what the adopter did not declare."""
+    settings = dict(OBJECT_STORAGE_DEFAULTS)
+    declared = get(values, "environment", "object_storage", default={})
+    if isinstance(declared, dict):
+        for key in settings:
+            value = declared.get(key)
+            if value is not None and value != "":
+                settings[key] = value
+    settings["endpoint"] = str(settings["endpoint"]).strip()
+    settings["path_style_access"] = bool(settings["path_style_access"])
+    cron = str(settings["generation_cron"]).strip()
+    if len(cron.split()) != 5:
+        raise ValueError(
+            "environment.object_storage.generation_cron must have 5 fields "
+            "(minute hour day month weekday)."
+        )
+    settings["generation_cron"] = cron
+    if settings["endpoint"] and not (settings["access_key"] and settings["secret_key"]):
+        raise ValueError(
+            "environment.object_storage needs access_key and secret_key when endpoint is set. "
+            "Clear the endpoint to keep downloads on the WFS only."
+        )
+    return settings
+
+
 def validate_job_migration_path(root: Path) -> None:
     raw = read_dotenv_value(
         root / ".env",
@@ -2564,6 +2930,34 @@ def validate_job_migration_path(root: Path) -> None:
         )
 
 
+def write_geo_file_generation_config(root: Path, values: dict[str, Any]) -> dict[str, Any]:
+    """Generates the runtime YAML of the pre-generation job from the adopter values.
+
+    The connection details also go to .env, because Compose passes them to the backend,
+    which reads the same bucket.
+    """
+    storage = object_storage_settings(values)
+    example = root / "config/Job-Geo-File-Generation/application/application.yaml.example"
+    document = yaml.safe_load(example.read_text(encoding="utf-8"))
+    document["dsp"]["object-storage"].update(
+        {
+            "endpoint": storage["endpoint"],
+            "region": storage["region"],
+            "bucket": storage["bucket"],
+            "access-key": storage["access_key"],
+            "secret-key": storage["secret_key"],
+            "path-style-access": storage["path_style_access"],
+        }
+    )
+    # No endpoint means no storage to publish to: the job runs and does nothing, which
+    # is noisier than not running it.
+    document["execution-jobs"]["geo-file-generation-job"] = bool(storage["endpoint"])
+    output = root / "config/Job-Geo-File-Generation/application/application.yaml"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(dump_yaml(document), encoding="utf-8")
+    return storage
+
+
 def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     example = root / "config/adopter/adopter-config.yaml.example"
     template = yaml.safe_load(example.read_text(encoding="utf-8"))
@@ -2575,6 +2969,9 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     validate_theme_kpis(values)
     config_changed = reset_disabled_themes(values, template, theme_count)
     config_changed = sync_map_layer_names(values) or config_changed
+    etl = values.get("etl")
+    if isinstance(etl, dict) and etl.pop("jobs", None) is not None:
+        config_changed = True
     if config_changed:
         write_adopter_config(active, values, template)
     source_values = []
@@ -2767,23 +3164,13 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         aoi["updated-at-column"] = updated_at_column
     else:
         aoi.pop("updated-at-column", None)
-    canonical_source = {
-        aoi["primary-key"],
-        aoi["creation-date-column"],
-        aoi["territory-level-3-column"],
-        aoi["total-area-column"],
-        aoi["updated-at-column"],
-        aoi["commune-id-column"],
-        aoi["geometry-column"],
-    }
-    if updated_at_column:
-        canonical_source.add(updated_at_column)
-    for column in additional_columns:
-        if column in canonical_source:
-            raise ValueError(
-                "etl.area_of_interest.additional_columns entry "
-                f"'{column}' duplicates a required column mapping."
-            )
+    canonical_source = aoi_canonical_source_columns(aoi_values)
+    reject_source_and_target_clashes(
+        additional_columns,
+        canonical_source,
+        AOI_CANONICAL_TARGET_COLUMNS,
+        "etl.area_of_interest.additional_columns",
+    )
     aoi["additional-columns"] = additional_columns
     aoi.pop("comparison-columns", None)
     aoi.pop("column-mapping", None)
@@ -2791,34 +3178,38 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     aoi.pop("total-area-column", None)
     migration["kpis"] = build_migration_kpis(values)
     migration["batch"]["layers"] = build_batch_layers(extra_layers)
-    jobs = etl.get("jobs", {})
-    job_names = {
-        "level1": "admin-unit-level-1-geoserver-job",
-        "level2": "admin-unit-level-2-geoserver-job",
-        "level3": "admin-unit-level-3-geoserver-job",
-        "area_of_interest": "area-of-interest-geoserver-job",
-    }
-    for name, target in job_names.items():
-        migration["execution-jobs"][target] = bool(jobs.get(name, True))
-    layer_jobs_enabled = bool(jobs.get("layer_jobs", bool(extra_layers)))
+    migration["execution-jobs"]["admin-unit-level-1-geoserver-job"] = True
+    migration["execution-jobs"]["admin-unit-level-2-geoserver-job"] = True
+    migration["execution-jobs"]["admin-unit-level-3-geoserver-job"] = True
+    migration["execution-jobs"]["area-of-interest-geoserver-job"] = True
+    layer_jobs_enabled = bool(extra_layers)
     migration["execution-jobs"]["layer-jobs"] = layer_jobs_enabled
     migration["execution-jobs"]["kpi-job"] = bool(
         jobs.get("kpi_job", jobs.get("area_of_interest", True))
     )
     output = root / "config/Job-Data-Migration/application/application.yaml"
     output.write_text(dump_yaml(migration), encoding="utf-8")
+
+    storage = write_geo_file_generation_config(root, values)
     replace_env(root / ".env", values)
     if not quiet:
         print("Configuration files generated successfully.")
         if extra_layers:
-            print(f"  Generic layers: {len(extra_layers)} (layer-jobs={layer_jobs_enabled})")
+            print(f"  Generic layers: {len(extra_layers)}")
         print(f"  Download themes: {len(download_themes.get('themes', []))}")
+        if storage["endpoint"]:
+            print(
+                f"  Pre-generated files: bucket '{storage['bucket']}' "
+                f"at {storage['endpoint']} (cron {storage['generation_cron']})"
+            )
+        else:
+            print("  Pre-generated files: disabled (downloads served by the WFS)")
         print("\nNext steps:")
         print(f"  1. Review: {active}")
         print(
             "  2. For SQL subqueries, keep source_table in a YAML folded block (>-)"
         )
-        print("  3. Run ./setup.sh and choose option 2 (migrate) or 3 (no migration).")
+        print("  3. Run ./setup.sh and choose Real adopter.")
         print("  4. Run ./start.sh to start the application.")
 
 def main() -> None:

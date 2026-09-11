@@ -492,7 +492,7 @@ yaml_target_table() {
   yaml_scalar "$1" "$2" "target-table"
 }
 
-# Print ETL lines for batch.layers (generic layers → geo-target dsp.<source_table>).
+# Print ETL lines for batch.layers (generic layers → geo-target dsp.<layer_name>).
 # Prints nothing when the list is empty or missing (caller shows "(none)").
 yaml_generic_layers_etl_lines() {
   local file="$1"
@@ -505,7 +505,10 @@ yaml_generic_layers_etl_lines() {
       if (src == "") return
       n = split(src, parts, ".")
       tbl = parts[n]
-      tgt = "dsp." tbl
+      phys = lname
+      gsub(/-/, "_", phys)
+      if (phys == "") phys = tbl
+      tgt = "dsp." phys
       status = ""
       if (enabled == "false") status = " (disabled)"
       if (lname != "") {
@@ -587,14 +590,6 @@ yaml_generic_layers_etl_lines() {
   ' "$file"
 }
 
-job_enabled_label() {
-  if [ "${1:-false}" = "true" ]; then
-    echo "enabled"
-  else
-    echo "disabled"
-  fi
-}
-
 # Resolve ${VAR_NAME} using a variable already exported in the shell (.env).
 resolve_env_placeholder() {
   local raw="$1"
@@ -613,12 +608,29 @@ resolve_env_placeholder() {
 print_migration_preview() {
   local cfg="$1"
   local will_run="${2:-false}"
-  local run_label="disabled"
+  local first_run_label=""
+  local recurrence_label=""
   if [ "$will_run" = "true" ]; then
-    run_label="enabled (runs during this setup)"
-  elif [ "${KEEP_MIGRATION_SERVICE:-false}" = "true" ]; then
-    run_label="scheduled (${MIGRATION_EXECUTION_MODE:-unknown})"
+    first_run_label="during this setup"
+  elif [ -n "${MIGRATION_SCHEDULED_AT:-}" ]; then
+    first_run_label="scheduled at ${MIGRATION_SCHEDULED_AT} (${DSP_MIGRATION_TZ})"
+  else
+    first_run_label="not configured"
   fi
+  case "${MIGRATION_EXECUTION_MODE:-once}" in
+    once)
+      recurrence_label="one-time"
+      ;;
+    scheduled-once)
+      recurrence_label="one-time (scheduled)"
+      ;;
+    continuous)
+      recurrence_label="continuous"
+      ;;
+    *)
+      recurrence_label="${MIGRATION_EXECUTION_MODE:-unknown}"
+      ;;
+  esac
 
   local batch_url source_url target_url
   local batch_user source_user target_user
@@ -644,20 +656,11 @@ print_migration_preview() {
   local generic_layers_lines
   generic_layers_lines="$(yaml_generic_layers_etl_lines "$cfg")"
 
-  local j1 j2 j3 j_aoi j_layers
-  j1="$(yaml_scalar "$cfg" "execution-jobs" "admin-unit-level-1-geoserver-job")"
-  j2="$(yaml_scalar "$cfg" "execution-jobs" "admin-unit-level-2-geoserver-job")"
-  j3="$(yaml_scalar "$cfg" "execution-jobs" "admin-unit-level-3-geoserver-job")"
-  j_aoi="$(yaml_scalar "$cfg" "execution-jobs" "area-of-interest-geoserver-job")"
-  j_layers="$(yaml_scalar "$cfg" "execution-jobs" "layer-jobs")"
-
   info "Migration configuration preview:"
-  echo "  Job execution: ${run_label}"
+  echo "  First run: ${first_run_label}"
+  echo "  Recurrence: ${recurrence_label}"
   if [ -n "${MIGRATION_CRON:-}" ]; then
     echo "  Cron: ${MIGRATION_CRON} (tz=${DSP_MIGRATION_TZ})"
-  fi
-  if [ -n "${MIGRATION_SCHEDULED_AT:-}" ]; then
-    echo "  Scheduled at: ${MIGRATION_SCHEDULED_AT} (tz=${DSP_MIGRATION_TZ})"
   fi
   echo "  Datasources:"
   echo "    batch:  ${batch_url:-<missing>} (user: ${batch_user:-<missing>})"
@@ -674,12 +677,6 @@ print_migration_preview() {
   else
     echo "      (none)"
   fi
-  echo "  Jobs:"
-  echo "    level 1: $(job_enabled_label "$j1")"
-  echo "    level 2: $(job_enabled_label "$j2")"
-  echo "    level 3: $(job_enabled_label "$j3")"
-  echo "    area of interest: $(job_enabled_label "$j_aoi")"
-  echo "    layer jobs: $(job_enabled_label "$j_layers")"
 }
 
 wait_for_db() {
@@ -697,8 +694,43 @@ wait_for_db() {
   return 1
 }
 
-# pg_isready answers while /docker-entrypoint-initdb.d scripts are still running,
-# so wait for a schema created by the init SQL before touching the tables.
+# pg_isready alone is not enough on a fresh volume: the entrypoint may still be PID 1
+# while a temporary PostgreSQL serves /docker-entrypoint-initdb.d scripts.
+_postgres_definitive_and_ready() {
+  local service="$1"
+  local user="$2"
+  local db="$3"
+  local comm=""
+
+  comm="$(docker compose --env-file .env exec -T "$service" \
+    sh -c 'tr -d "\0" < /proc/1/comm 2>/dev/null' 2>/dev/null | tr -d '[:space:]')"
+  if [ "$comm" != "postgres" ]; then
+    return 1
+  fi
+
+  docker compose --env-file .env exec -T "$service" \
+    pg_isready -U "$user" -d "$db" >/dev/null 2>&1
+}
+
+wait_for_postgres_initialization() {
+  local service="$1"
+  local user="$2"
+  local db="$3"
+  local i
+
+  for i in $(seq 1 90); do
+    if _postgres_definitive_and_ready "$service" "$user" "$db"; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  error "${service} did not finish PostgreSQL initialization in time (PID 1 is not postgres or pg_isready failed)."
+  docker compose --env-file .env logs --tail 40 "$service" || true
+  return 1
+}
+
+# Confirms init SQL created the expected schema (call after wait_for_postgres_initialization).
 wait_for_db_schema() {
   local service="$1"
   local user="$2"
@@ -718,13 +750,52 @@ wait_for_db_schema() {
 }
 
 wait_for_data_migration_schema() {
-  info "Waiting for dsp-db schema data_migration..."
   if ! wait_for_db_schema dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}" data_migration; then
     error "dsp-db init SQL did not create schema 'data_migration' in time."
     docker compose --env-file .env logs --tail 40 dsp-db || true
+    return 1
+  fi
+  return 0
+}
+
+dsp_db_schema_exists() {
+  local schema="$1"
+  docker compose --env-file .env exec -T dsp-db \
+      psql -U "${DSP_DB_USER:-dsp}" -d "${DSP_DB_NAME:-dsp-db}" -tAc \
+      "SELECT 1 FROM information_schema.schemata WHERE schema_name = '${schema}'" \
+      2>/dev/null | grep -q '^1$'
+}
+
+# Init SQL in the dsp-db image only runs on an empty volume. Existing installs
+# get the geo-file Batch schema by applying the same file once (CREATE IF NOT EXISTS).
+apply_geo_file_generation_schema_if_missing() {
+  local sql="$ROOT_DIR/config/db/dsp-db/03_geo_file_generation_batch.sql"
+  if dsp_db_schema_exists geo_file_generation; then
+    return 0
+  fi
+  info "Applying geo_file_generation Spring Batch schema on dsp-db..."
+  if [ ! -f "$sql" ]; then
+    error "Missing ${sql}"
     exit 1
   fi
-  ok "dsp-db schema data_migration ready"
+  if ! docker compose --env-file .env exec -T dsp-db \
+      psql -U "${DSP_DB_USER:-dsp}" -d "${DSP_DB_NAME:-dsp-db}" -v ON_ERROR_STOP=1 \
+      < "$sql"; then
+    error "Failed to apply schema geo_file_generation on dsp-db."
+    docker compose --env-file .env logs --tail 40 dsp-db || true
+    exit 1
+  fi
+}
+
+wait_for_geo_file_generation_schema() {
+  apply_geo_file_generation_schema_if_missing
+  info "Waiting for dsp-db schema geo_file_generation..."
+  if ! wait_for_db_schema dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}" geo_file_generation; then
+    error "dsp-db did not create schema 'geo_file_generation' in time."
+    docker compose --env-file .env logs --tail 40 dsp-db || true
+    exit 1
+  fi
+  ok "dsp-db schema geo_file_generation ready"
 }
 
 validate_positive_integer() {
@@ -791,6 +862,7 @@ require_docker() {
 DSP_REPO_BACKEND_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-backend.git"
 DSP_REPO_FRONTEND_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-frontend.git"
 DSP_REPO_JOB_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-job-data-migration.git"
+DSP_REPO_GEO_FILE_JOB_URL="https://github.com/Rural-Environmental-Registry/rer-dsp-job-geo-file-generation.git"
 
 require_git() {
   if ! command -v git >/dev/null 2>&1; then
@@ -892,6 +964,7 @@ ensure_dsp_repositories() {
   local want_backend=false
   local want_frontend=false
   local want_job=false
+  local want_geo_file_job=false
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -904,6 +977,9 @@ ensure_dsp_repositories() {
       --job)
         want_job=true
         ;;
+      --geo-file-job)
+        want_geo_file_job=true
+        ;;
       *)
         error "Unknown ensure_dsp_repositories option: $1"
         exit 1
@@ -912,8 +988,9 @@ ensure_dsp_repositories() {
     shift
   done
 
-  if [ "$want_backend" = false ] && [ "$want_frontend" = false ] && [ "$want_job" = false ]; then
-    error "ensure_dsp_repositories: pass at least one of --backend, --frontend, --job"
+  if [ "$want_backend" = false ] && [ "$want_frontend" = false ] && [ "$want_job" = false ] \
+    && [ "$want_geo_file_job" = false ]; then
+    error "ensure_dsp_repositories: pass at least one of --backend, --frontend, --job, --geo-file-job"
     exit 1
   fi
 
@@ -978,6 +1055,14 @@ ensure_dsp_repositories() {
       "Migration job"
   fi
 
+  if [ "$want_geo_file_job" = true ]; then
+    _ensure_dsp_repo_check \
+      "rer-dsp-job-geo-file-generation" \
+      "${DSP_JOB_GEO_FILE_GENERATION_PATH:-../rer-dsp-job-geo-file-generation}" \
+      "$DSP_REPO_GEO_FILE_JOB_URL" \
+      "Geo file generation job"
+  fi
+
   if [ "${#missing_labels[@]}" -eq 0 ]; then
     return 0
   fi
@@ -1017,11 +1102,11 @@ ensure_dsp_repositories() {
 reject_legacy_migration_env() {
   if [ -n "${DSP_RUN_MIGRATION+x}" ]; then
     error "DSP_RUN_MIGRATION is no longer supported."
-    error "Remove it from .env and choose option 2 or 3 in ./setup.sh."
+    error "Remove it from .env and run ./setup.sh (Real adopter)."
     exit 1
   fi
   if [ -n "${DSP_SKIP_MIGRATION+x}" ]; then
-    error "DSP_SKIP_MIGRATION is no longer supported. Remove it from .env and choose option 3 in ./setup.sh if you do not want to migrate."
+    error "DSP_SKIP_MIGRATION is no longer supported. Remove it from .env and run ./setup.sh again."
     exit 1
   fi
   if [ -n "${DSP_MIGRATION_SYNC_INTERVAL:-}" ]; then
@@ -1138,8 +1223,13 @@ run_migration_job_once() {
 
 start_migration_service_stack() {
   info "Starting migration service stack (profile=migration)..."
-  wait_for_data_migration_schema
-  docker compose --env-file .env --profile migration up -d dsp-job-migration
+  if ! wait_for_postgres_initialization dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}"; then
+    exit 1
+  fi
+  if ! wait_for_data_migration_schema; then
+    exit 1
+  fi
+  docker compose --env-file .env --profile migration up -d --build dsp-job-migration
   if is_continuous_migration_mode; then
     docker update --restart unless-stopped dsp-job-migration >/dev/null 2>&1 || true
   else
@@ -1157,6 +1247,41 @@ ensure_migration_service_if_needed() {
     return 0
   fi
   start_migration_service_stack
+}
+
+# The endpoint is the switch: without a place to publish to, the job has nothing to do
+# and downloads keep coming from the WFS.
+is_geo_file_generation_enabled() {
+  [ -n "${DSP_OBJECT_STORAGE_ENDPOINT:-}" ]
+}
+
+start_geo_file_generation_service() {
+  info "Starting geo file generation service (profile=geo-file)..."
+  wait_for_geo_file_generation_schema
+  docker compose --env-file .env --profile geo-file up -d --build dsp-job-geo-file-generation
+  ok "Geo file generation service ready (cron=${DSP_GEO_FILE_GENERATION_CRON:-0 2 * * *})"
+}
+
+ensure_geo_file_generation_service_if_needed() {
+  if ! is_geo_file_generation_enabled; then
+    return 0
+  fi
+  ensure_dsp_repositories --geo-file-job
+  start_geo_file_generation_service
+}
+
+print_geo_file_generation_hints() {
+  if ! is_geo_file_generation_enabled; then
+    echo ""
+    echo "Pre-generated download files: disabled (downloads served by the WFS)."
+    echo "Run ./config.sh and fill in the object storage endpoint to enable them."
+    return 0
+  fi
+  echo ""
+  echo "Pre-generated download files: bucket ${DSP_OBJECT_STORAGE_BUCKET:-dsp-geo-files}" \
+    "at ${DSP_OBJECT_STORAGE_ENDPOINT} (cron=${DSP_GEO_FILE_GENERATION_CRON:-0 2 * * *})"
+  echo "Optional one-shot generation (in addition to the schedule):"
+  echo "  docker compose --env-file .env --profile geo-file run --rm -e DSP_GEO_FILE_GENERATION_EXECUTION_MODE=once dsp-job-geo-file-generation"
 }
 
 print_migration_resync_hints() {
@@ -1206,15 +1331,12 @@ ensure_adopter_config() {
 }
 
 start_databases_and_wait() {
-  local include_migration_db="${1:-false}"
-
   info "Starting databases (dsp-db, dsp-geoserver-db)..."
-  docker compose --env-file .env up -d dsp-db dsp-geoserver-db
+  docker compose --env-file .env up -d --build dsp-db dsp-geoserver-db
   ok "Database containers started"
 
-  info "Waiting for databases to become healthy..."
-  if ! wait_for_db dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}"; then
-    error "dsp-db did not become ready in time."
+  info "Waiting for dsp-db PostgreSQL initialization..."
+  if ! wait_for_postgres_initialization dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}"; then
     exit 1
   fi
   if ! wait_for_db_schema dsp-db "${DSP_DB_USER:-dsp}" "${DSP_DB_NAME:-dsp-db}" dsp; then
@@ -1222,10 +1344,13 @@ start_databases_and_wait() {
     docker compose --env-file .env logs --tail 40 dsp-db || true
     exit 1
   fi
+  if ! wait_for_data_migration_schema; then
+    exit 1
+  fi
   ok "dsp-db ready"
 
-  if ! wait_for_db dsp-geoserver-db "${DSP_GEOSERVER_DB_USER:-dsp_geo}" "${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db}"; then
-    error "dsp-geoserver-db did not become ready in time."
+  info "Waiting for dsp-geoserver-db PostgreSQL initialization..."
+  if ! wait_for_postgres_initialization dsp-geoserver-db "${DSP_GEOSERVER_DB_USER:-dsp_geo}" "${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db}"; then
     exit 1
   fi
   if ! wait_for_db_schema dsp-geoserver-db "${DSP_GEOSERVER_DB_USER:-dsp_geo}" "${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db}" dsp; then
@@ -1235,9 +1360,6 @@ start_databases_and_wait() {
   fi
   ok "dsp-geoserver-db ready"
 
-  if [ "$include_migration_db" = "true" ]; then
-    wait_for_data_migration_schema
-  fi
   ok "Databases are ready"
 }
 
@@ -1424,7 +1546,8 @@ show_stack_status_menu() {
 }
 
 # Interactive data-prep menu for ./setup.sh.
-# Sets globals: SETUP_MODE (demo|real), WILL_MIGRATE, INCLUDE_MIGRATION_DB.
+# Sets globals: SETUP_MODE (demo|real), WILL_MIGRATE, KEEP_MIGRATION_SERVICE,
+# MIGRATION_EXECUTION_MODE, MIGRATION_CRON, MIGRATION_SCHEDULED_AT.
 # Not a command substitution on purpose: error output must reach the terminal.
 prompt_setup_data_mode() {
   echo ""
@@ -1439,41 +1562,28 @@ prompt_setup_data_mode() {
   echo "     Requires ./config.sh first, then runs ETL from your JDBC source into dsp-db and the GeoServer DB."
   echo "     Use for a production-like setup when your source database is ready to import."
   echo ""
-  echo "  3) Real adopter — no migration (empty DBs, UI/GeoServer config only)"
-  echo "     Applies adopter configuration (labels, map layers, SRIDs) but keeps databases empty."
-  echo "     Use when setting up the stack before data is available, or when you will migrate later with option 2."
-  echo ""
-  echo "  4) Stack status / cleanup / exit"
+  echo "  3) Stack status / cleanup / exit"
   echo "     Shows container status and service URLs; optionally removes this project's Docker resources, then exits."
   echo "     Use to inspect the stack or reset containers/volumes without loading or migrating data."
   echo ""
   echo "How do you want to prepare data?"
   local choice=""
-  read -r -p "Choice [1/2/3/4]: " choice || true
+  read -r -p "Choice [1/2/3]: " choice || true
   case "$choice" in
     1)
       SETUP_MODE="demo"
       WILL_MIGRATE=false
-      INCLUDE_MIGRATION_DB=false
       KEEP_MIGRATION_SERVICE=false
       ;;
     2)
       SETUP_MODE="real"
-      WILL_MIGRATE=true
-      INCLUDE_MIGRATION_DB=true
-      prompt_migration_execution_mode
+      prompt_real_adopter_migration_plan
       ;;
     3)
-      SETUP_MODE="real"
-      WILL_MIGRATE=false
-      INCLUDE_MIGRATION_DB=true
-      prompt_deferred_migration_plan
-      ;;
-    4)
       show_stack_status_menu
       ;;
     *)
-      error "Invalid choice: '${choice}' — use 1 (demonstration), 2 (real + ETL), 3 (real without migration) or 4 (status)."
+      error "Invalid choice: '${choice}' — use 1 (demonstration), 2 (real adopter) or 3 (status)."
       error "Run './${DSP_ORCHESTRATION_SCRIPT}' again."
       exit 1
       ;;
@@ -1497,23 +1607,21 @@ prompt_migration_hhmm() {
   done
 }
 
-# Sets MIGRATION_CRON. Time is asked only for "every day" when no clock was already chosen (option 2).
-# $1 optional HH:MM from option 3 When — reused for daily cron, not asked again.
+# Sets MIGRATION_CRON. Time is asked only for "every day" when no clock was already chosen.
+# $1 optional HH:MM from a scheduled first run — reused for daily cron, not asked again.
 prompt_migration_how_often() {
   local hhmm="${1:-}"
   local freq_choice step
   echo ""
-  echo "How often should synchronization run?"
+  echo "How often should the data be synchronized after the initial migration?"
   echo ""
   if [ -n "$hhmm" ]; then
-    echo "  1) Every day at that time (${hhmm})"
+    echo "  1) Every day at this time (${hhmm})"
   else
     echo "  1) Every day at a given time"
   fi
   echo "  2) Every N hours"
-  echo "     N must divide 24 (1, 2, 3, 4, 6, 8, 12 or 24)."
   echo "  3) Every N minutes"
-  echo "     N is 1–59 (useful for local testing)."
   echo ""
   while true; do
     read -r -p "Choice [1]: " freq_choice || true
@@ -1541,6 +1649,11 @@ prompt_migration_how_often() {
           step="6"
         fi
         if MIGRATION_CRON="$(dsp_build_hourly_cron "$step")"; then
+          case "$step" in
+            6) echo "  Runs at 00:00, 06:00, 12:00, and 18:00." ;;
+            24) echo "  Runs once per day at 00:00." ;;
+            *) echo "  Runs at minute 0 every ${step} hours (aligned to midnight)." ;;
+          esac
           break
         fi
         error "Invalid interval: '${step}' — use 1, 2, 3, 4, 6, 8, 12 or 24."
@@ -1562,12 +1675,12 @@ prompt_migration_how_often() {
   ok "Schedule cron: ${MIGRATION_CRON}"
 }
 
-# Option 3 + once or continuous. Sets MIGRATION_SCHEDULED_AT and MIGRATION_HHMM.
+# Scheduled first run. Sets MIGRATION_SCHEDULED_AT and MIGRATION_HHMM.
 # Fuso: DSP_MIGRATION_TZ (já carregado do .env por ensure_dotenv).
 prompt_migration_when() {
   local date_ymd today
   echo ""
-  echo "When should the migration start?"
+  echo "Enter the date and time for the first migration:"
   today="$(TZ="${DSP_MIGRATION_TZ}" date +%F)"
   while true; do
     read -r -p "Date (YYYY-MM-DD) [${today}]: " date_ymd || true
@@ -1588,72 +1701,85 @@ prompt_migration_when() {
   done
 }
 
-# Option 3: same 1/2 choices, wording does not claim the job runs during this setup.
-prompt_deferred_migration_plan() {
-  KEEP_MIGRATION_SERVICE=true
+# Real adopter: when to run the first migration, then one-time vs continuous.
+prompt_real_adopter_migration_plan() {
+  local when_choice how_choice run_now=false
+
+  WILL_MIGRATE=false
+  KEEP_MIGRATION_SERVICE=false
   MIGRATION_CRON=""
   MIGRATION_SCHEDULED_AT=""
+
   echo ""
-  echo "How should the migration job run after setup?"
+  echo "When should the initial migration run?"
   echo ""
-  echo "  1) One-time migration"
-  echo "     Does not run during this setup. Runs once at the time you choose next,"
-  echo "     then stops and removes the migration job Docker container."
+  echo "  1) Run now"
+  echo "     Runs the first migration during this setup."
   echo ""
-  echo "  2) Continuous service (periodic re-sync)"
-  echo "     Does not run during this setup. Starts at the time you choose, then keeps"
-  echo "     the job container running and re-syncs from the source on a schedule you choose."
+  echo "  2) Schedule for later"
+  echo "     Waits until the date and time you choose, then runs the first migration."
   echo ""
-  local choice=""
-  read -r -p "Choice [1/2]: " choice || true
-  case "$choice" in
+  read -r -p "Choice [1/2]: " when_choice || true
+  case "$when_choice" in
     1|"")
-      MIGRATION_EXECUTION_MODE="scheduled-once"
-      prompt_migration_when
+      run_now=true
       ;;
     2)
-      MIGRATION_EXECUTION_MODE="continuous"
+      run_now=false
       prompt_migration_when
-      prompt_migration_how_often "$MIGRATION_HHMM"
       ;;
     *)
-      error "Invalid choice: '${choice}' — use 1 (one-time) or 2 (continuous service)."
+      error "Invalid choice: '${when_choice}' — use 1 (run now) or 2 (schedule for later)."
       error "Run './${DSP_ORCHESTRATION_SCRIPT}' again."
       exit 1
       ;;
   esac
-}
 
-# Sets global MIGRATION_EXECUTION_MODE (once|continuous) after option 2 in ./setup.sh.
-# When continuous, also sets MIGRATION_CRON via prompt_migration_how_often.
-prompt_migration_execution_mode() {
-  KEEP_MIGRATION_SERVICE=false
-  MIGRATION_CRON=""
-  MIGRATION_SCHEDULED_AT=""
   echo ""
-  echo "How should the migration job run after setup?"
+  echo "How should the migration run?"
   echo ""
-  echo "  1) One-time migration job (recommended for first import)"
-  echo "     Runs the job once during setup, then removes the job container."
-  echo "     You can safely run this multiple times as it only imports new or updated records."
+  echo "  1) One-time"
+  if [ "$run_now" = "true" ]; then
+    echo "     Runs once during this setup, then stops the migration job container."
+  else
+    echo "     Runs once at the scheduled time, then stops the migration job container."
+  fi
   echo ""
-  echo "  2) Continuous service (periodic re-sync)"
-  echo "     Runs the initial migration, then keeps the job container running"
-  echo "     and re-syncs from the source on an interval you choose."
+  echo "  2) Continuous (periodic re-sync)"
+  if [ "$run_now" = "true" ]; then
+    echo "     Runs the first migration during this setup, then keeps the job container"
+    echo "     running and re-syncs from the source on a recurring schedule you choose next."
+  else
+    echo "     Runs the first migration at the scheduled time, then keeps the job container"
+    echo "     running and re-syncs from the source on a recurring schedule you choose next."
+  fi
   echo ""
-  local choice=""
-  read -r -p "Choice [1/2]: " choice || true
-  case "$choice" in
+  read -r -p "Choice [1/2]: " how_choice || true
+  case "$how_choice" in
     1|"")
-      MIGRATION_EXECUTION_MODE="once"
+      if [ "$run_now" = "true" ]; then
+        WILL_MIGRATE=true
+        MIGRATION_EXECUTION_MODE="once"
+        KEEP_MIGRATION_SERVICE=false
+      else
+        WILL_MIGRATE=false
+        MIGRATION_EXECUTION_MODE="scheduled-once"
+        KEEP_MIGRATION_SERVICE=true
+      fi
       ;;
     2)
       MIGRATION_EXECUTION_MODE="continuous"
       KEEP_MIGRATION_SERVICE=true
-      prompt_migration_how_often
+      if [ "$run_now" = "true" ]; then
+        WILL_MIGRATE=true
+        prompt_migration_how_often
+      else
+        WILL_MIGRATE=false
+        prompt_migration_how_often "$MIGRATION_HHMM"
+      fi
       ;;
     *)
-      error "Invalid choice: '${choice}' — use 1 (one-time) or 2 (continuous service)."
+      error "Invalid choice: '${how_choice}' — use 1 (one-time) or 2 (continuous)."
       error "Run './${DSP_ORCHESTRATION_SCRIPT}' again."
       exit 1
       ;;
@@ -1849,9 +1975,9 @@ start_geoserver_exhibition() {
   fi
 
   if [ "$mode" = "up" ]; then
-    # start.sh: ensure the container is up without forced rebuild (setup already published layers).
-    info "Starting GeoServer Exhibition..."
-    docker compose --env-file .env up -d dsp-geoserver-exhibition
+    # start.sh: rebuild so map JSON in the image is current; does not republish layers.
+    info "Building and starting GeoServer Exhibition..."
+    docker compose --env-file .env up -d --build dsp-geoserver-exhibition
   else
     # populate | start — setup builds the image; populate also publishes layers.
     info "Building and starting GeoServer Exhibition..."
@@ -1883,8 +2009,8 @@ start_geoserver_download() {
   local mode="${1:-up}"
 
   if [ "$mode" = "up" ]; then
-    info "Starting GeoServer Download..."
-    docker compose --env-file .env up -d dsp-geoserver-download
+    info "Building and starting GeoServer Download..."
+    docker compose --env-file .env up -d --build dsp-geoserver-download
   else
     info "Building and starting GeoServer Download..."
     docker compose --env-file .env up -d --build dsp-geoserver-download
@@ -1916,8 +2042,8 @@ start_gateway() {
   base_url="$(dsp_public_base_url)"
   local i
 
-  info "Starting gateway (nginx)..."
-  docker compose --env-file .env up -d dsp-gateway
+  info "Building and starting gateway (nginx)..."
+  docker compose --env-file .env up -d --build dsp-gateway
   ok "Gateway container started"
 
   info "Waiting for the gateway at ${base_url}/gateway/health ..."
@@ -2002,6 +2128,7 @@ print_stack_usage_hints() {
   echo "Verify tables:"
   echo "  docker compose exec dsp-db psql -U ${DSP_DB_USER:-dsp} -d ${DSP_DB_NAME:-dsp-db} -c '\\dt dsp.*'"
   echo "  docker compose exec dsp-db psql -U ${DSP_DB_USER:-dsp} -d ${DSP_DB_NAME:-dsp-db} -c '\\dt data_migration.*'"
+  echo "  docker compose exec dsp-db psql -U ${DSP_DB_USER:-dsp} -d ${DSP_DB_NAME:-dsp-db} -c '\\dt geo_file_generation.*'"
   echo "  docker compose exec dsp-geoserver-db psql -U ${DSP_GEOSERVER_DB_USER:-dsp_geo} -d ${DSP_GEOSERVER_DB_NAME:-dsp-geoserver-db} -c '\\dt dsp.*'"
   echo ""
   echo "Migrate / (re)populate data:"

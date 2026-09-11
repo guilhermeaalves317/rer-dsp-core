@@ -48,7 +48,7 @@ fi
 
 if [ ! -f "$MAP_LAYERS_CONFIG" ]; then
   echo "mapLayersConfig.json not found: $MAP_LAYERS_CONFIG"
-  echo "Mount config/map/mapLayersConfig.json into the container."
+  echo "Rebuild the GeoServer image after ./config.sh (./setup.sh or ./start.sh)."
   exit 1
 fi
 
@@ -181,7 +181,7 @@ detect_geometry_kind() {
   echo "$kind"
 }
 
-# Tables created by the job (AOI and extra layers) may not yet exist in option 3.
+# Tables created by the job (AOI and extra layers) may not yet exist when the first load is scheduled.
 table_exists() {
   local table_name=$1
   local found

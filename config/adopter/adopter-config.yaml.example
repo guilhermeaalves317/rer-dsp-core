@@ -3,8 +3,8 @@
 # This is the only file to edit in the advanced workflow.
 # DSP contract keys are kept by the core templates.
 # To fill in this file step by step, run: ./config.sh
-# Wizard order: 1 database, 2 tables/jobs, 3 application, 4 interface, 5 KPI configuration.
-# Quote strings only when YAML requires it (special characters). Numbers, booleans and null are not.
+# Wizard order: 1 database, 2 tables/layers, 3 application, 4 interface, 5 KPI configuration.
+# Quote strings only when YAML requires it (special characters). Numbers, booleans and null are not quoted.
 
 environment:
   # Source database connection used by the migration.
@@ -17,6 +17,20 @@ environment:
     territory_level_2: 4326
     territory_level_3: 4326
     area_of_interest: 4326
+  # Object storage with S3 API, where the pre-generated download files are published.
+  # The bucket must already exist: the job never creates it. With an empty endpoint the
+  # geo file job stays off and downloads keep going straight to the WFS.
+  object_storage:
+    endpoint: ""
+    region: "us-east-1"
+    bucket: "dsp-geo-files"
+    access_key: ""
+    secret_key: ""
+    # Path-style keeps the bucket in the path instead of the host name; endpoints that
+    # are not AWS usually need it on.
+    path_style_access: true
+    # Cron of the pre-generation job, in a window after the migration.
+    generation_cron: "0 2 * * *"
 
 etl:
   # Enter the tables and columns available in the source database.
@@ -78,22 +92,24 @@ etl:
     area_column: area
     additional_columns: []
     where_clause: "1=1"
-
-  # Extra geographic layers (generic). Each item migrates to dsp.<table> on
-  # geoserver-db, is published to GeoServer, and appears in the map panel.
+  
+  # Extra geographic layers (generic). Each item migrates to
+  # dsp.<layer_name> on geoserver-db,
+  # is published to GeoServer, and appears in the map panel.
+  # The same source_table may be repeated when layer_name differs.
   # Presentation and ETL share one entry to avoid drift. Leave empty when unused.
   # Filled by ./config.sh (stage 2) or edited here directly.
   #
   #   layers:
   #     - source_table: "<schema>.<table>"   # origin schema (e.g. public) — never dsp
-  #       parent_key: "<source_parent_pk>"   # AOI FK (e.g. aeroporto_id)
   #       primary_key: "<source_pk>"
-  #       created_at_column: "<source_created_at>"
-  #       updated_at_column: "<source_updated_at>"      # optional column
+  #       parent_key: "<source_parent_pk>"   # AOI FK (e.g. aeroporto_id)
   #       label_column: "<source_name>"                 # optional column
   #       geometry_column: "<source_geom>"
+  #       created_at_column: "<source_created_at>"
+  #       updated_at_column: "<source_updated_at>"      # optional column
   #       additional_columns: []
-  #       layer_name: "<wms_id>"             # technical id (lowercase, hyphens ok)
+  #       layer_name: "<wms_id>"             # technical id; destination = dsp.<name>
   #       srid: 4326
   #       where_clause: "1=1"
   #       display_name: "<ui_label>"         # human-readable map label
@@ -102,12 +118,6 @@ etl:
   #       color: "#2563EB"
   #       fill_color: "transparent"
   layers: []
-  jobs:
-    level1: true
-    level2: true
-    level3: true
-    area_of_interest: true
-    layer_jobs: true
 
   parallelization:
     level1:
