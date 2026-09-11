@@ -74,7 +74,8 @@ etl:
     created_at_column: "<source_created_at>"
     updated_at_column: "<source_updated_at>"           # optional column
     territory_level_3_column: "<source_territory_level_3_fk>"
-    area_column: "<source_area>"
+    # Placeholder fixo: área calculada pelo job KPI (não migrada da origem).
+    area_column: area
     additional_columns: []
     where_clause: "1=1"
 
@@ -134,7 +135,7 @@ installation:
     area_of_interest:
       label: "Registered properties"
       unit_of_measurement: "un."
-      optional_label: "ha"
+      optional_label: "m²"
       accent_color: "#d3e500"
     theme_1:
       layer: null
@@ -157,8 +158,8 @@ installation:
       unit_of_measurement: "m²"
       accent_color: "#8ce5b5"
   area:
-    unit: "ha"
-    unit_label: "ha"
+    unit: "m2"
+    unit_label: "m²"
   formats:
     date: "dd/MM/yyyy"
     date_time: "dd/MM/yyyy HH:mm"

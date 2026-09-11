@@ -48,6 +48,8 @@ CANONICAL_AOI_DETAIL_FIELDS = (
     "area",
 )
 KPI_AREA_UNITS = ("m²", "km²", "ft²", "ha")
+FIXED_AOI_AREA_COLUMN = "area"
+FIXED_AOI_COUNT_UNIT = "un."
 CALCULATED_AOI_DETAIL_FIELDS = (
     "calculated.latitude",
     "calculated.longitude",
@@ -496,17 +498,6 @@ def aoi_additional_columns(values: dict[str, Any]) -> list[str]:
     return parse_column_list(aoi.get("additional_columns"), "etl.area_of_interest.additional_columns")
 
 
-def aoi_business_only_persist_columns(values: dict[str, Any], theme_count: int) -> list[str]:
-    aoi = get(values, "etl", "area_of_interest", default={})
-    if not isinstance(aoi, dict):
-        return validate_business_only_persist_columns([], theme_count, "etl.area_of_interest.business_only_persist_columns")
-    return validate_business_only_persist_columns(
-        aoi.get("business_only_persist_columns"),
-        theme_count,
-        "etl.area_of_interest.business_only_persist_columns",
-    )
-
-
 def aoi_detail_field_options(additional_columns: list[str]) -> list[str]:
     """Valid details-panel keys: additional_columns ∪ canonical ∪ calculated.*."""
     options: list[str] = []
@@ -757,30 +748,6 @@ def resolve_optional_column(value: Any, prefix: str) -> str | None:
     return stripped
 
 
-def expected_theme_source_columns(theme_count: int) -> list[str]:
-    return [f"theme_{index}" for index in range(1, theme_count + 1)]
-
-
-def validate_business_only_persist_columns(raw: Any, theme_count: int, prefix: str) -> list[str]:
-    columns = parse_column_list(raw or [], prefix)
-    if theme_count == 0:
-        if columns:
-            raise ValueError(f"{prefix} must be empty when installation.kpis.theme_count is 0.")
-        return []
-    if len(columns) != theme_count:
-        raise ValueError(
-            f"{prefix} must contain exactly {theme_count} column name(s); found {len(columns)}."
-        )
-    expected = set(expected_theme_source_columns(theme_count))
-    if set(columns) != expected:
-        raise ValueError(
-            f"{prefix} must list theme_1 … theme_{theme_count} "
-            "(source column names or SQL aliases in source_table). "
-            f"Found: {', '.join(columns)}."
-        )
-    return expected_theme_source_columns(theme_count)
-
-
 def resolve_optional_layer_field(entry: dict[str, Any], field: str, prefix: str) -> str | None:
     value = entry.get(field)
     if value is None or value == "":
@@ -817,12 +784,6 @@ def reset_disabled_themes(
             kpis[code] = restored
         elif not kpis.get(code, {}).get("enabled", True):
             kpis[code]["enabled"] = True
-            changed = True
-
-    aoi = config["etl"]["area_of_interest"]
-    if theme_count == 0:
-        if aoi.get("business_only_persist_columns"):
-            aoi["business_only_persist_columns"] = []
             changed = True
     return changed
 
@@ -885,6 +846,28 @@ def ask_kpi_area_unit(default: str) -> str:
         return options[selected]
 
 
+def kpi_area_unit_to_code(unit: str) -> str:
+    """Normalize a KPI area unit label to a short code (e.g. m² -> m2)."""
+    return unit.strip().replace("²", "2")
+
+
+def sync_aoi_area_unit_installation(config: dict[str, Any]) -> None:
+    """Keep AOI count unit fixed and align detail-screen area units with the KPI picker."""
+    aoi_card = config["installation"]["kpis"]["area_of_interest"]
+    aoi_card["unit_of_measurement"] = FIXED_AOI_COUNT_UNIT
+    area_unit = str(aoi_card.get("optional_label") or KPI_AREA_UNITS[0])
+    area = config["installation"]["area"]
+    area["unit"] = kpi_area_unit_to_code(area_unit)
+    area["unit_label"] = area_unit
+
+
+def ensure_fixed_aoi_area_column(values: dict[str, Any]) -> None:
+    """AOI area is KPI-calculated; keep a fixed placeholder in the adopter config."""
+    aoi = get(values, "etl", "area_of_interest", default={})
+    if isinstance(aoi, dict):
+        aoi["area_column"] = FIXED_AOI_AREA_COLUMN
+
+
 def ask_kpi_layer_selection(
     config: dict[str, Any],
     *,
@@ -931,6 +914,7 @@ def ask_theme_kpi_configuration(
     print("=" * 72)
 
     ask_aoi_kpi_accent_color(config)
+    ask_aoi_kpi_area_unit(config)
 
     max_count = max_theme_kpi_count(config)
     layer_jobs_enabled = bool(get(config, "etl", "jobs", "layer_jobs", default=True))
@@ -1048,6 +1032,16 @@ def validate_theme_kpis(values: dict[str, Any]) -> None:
                 f"{prefix}.accent_color must be a #RGB or #RRGGBB value."
             )
 
+    aoi_card = get(values, "installation", "kpis", "area_of_interest", default={})
+    if not isinstance(aoi_card, dict):
+        raise ValueError("installation.kpis.area_of_interest must be a mapping.")
+    optional_label = aoi_card.get("optional_label")
+    if optional_label not in KPI_AREA_UNITS:
+        raise ValueError(
+            "installation.kpis.area_of_interest.optional_label must be one of: "
+            + ", ".join(KPI_AREA_UNITS)
+        )
+
 
 def build_migration_kpis(values: dict[str, Any]) -> dict[str, Any]:
     """Build the KPI block consumed by the migration job."""
@@ -1067,7 +1061,7 @@ def build_migration_kpis(values: dict[str, Any]) -> dict[str, Any]:
         "theme-count": int(theme_count),
         "themes": themes,
         "area-unit-of-measurement": get(
-            values, "installation", "kpis", "area_of_interest", "unit_of_measurement", default="m²"
+            values, "installation", "kpis", "area_of_interest", "optional_label", default="m²"
         ),
     }
 
@@ -1324,6 +1318,15 @@ def ask_aoi_kpi_accent_color(config: dict[str, Any]) -> None:
         "Highlight color for the KPI card.",
         "the application dashboard",
     )
+
+
+def ask_aoi_kpi_area_unit(config: dict[str, Any]) -> None:
+    """Configure AOI area unit with the same picker used for theme KPIs."""
+    card = config["installation"]["kpis"]["area_of_interest"]
+    card["optional_label"] = ask_kpi_area_unit(
+        str(card.get("optional_label") or KPI_AREA_UNITS[0])
+    )
+    sync_aoi_area_unit_installation(config)
 
 
 def sync_map_layer_names(config: dict[str, Any]) -> bool:
@@ -2187,7 +2190,6 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
                 "created_at_column",
                 "updated_at_column",
                 "territory_level_3_column",
-                "area_column",
             ),
         ),
     ):
@@ -2212,32 +2214,13 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
             if field == "geometry_column":
                 ask_entity_layer_srid(config, srs_key, srs_label)
         if name == "area_of_interest":
+            config["etl"][name]["area_column"] = FIXED_AOI_AREA_COLUMN
             config["etl"][name]["additional_columns"] = ask_optional_column_list(
                 "Extra columns to migrate",
                 config["etl"][name].get("additional_columns") or [],
                 etl_field_help("additional_columns"),
                 "the ETL job mapping for this entity",
             )
-            if theme_count > 0:
-                default_themes = expected_theme_source_columns(theme_count)
-                while True:
-                    selected = ask_optional_column_list(
-                        "Theme KPI columns (business_only_persist_columns)",
-                        config["etl"][name].get("business_only_persist_columns") or default_themes,
-                        etl_field_help("business_only_persist_columns"),
-                        "the ETL job mapping for this entity",
-                    )
-                    try:
-                        config["etl"][name]["business_only_persist_columns"] = validate_business_only_persist_columns(
-                            selected,
-                            theme_count,
-                            "etl.area_of_interest.business_only_persist_columns",
-                        )
-                        break
-                    except ValueError as exc:
-                        print(f"\n  {exc}")
-            else:
-                config["etl"][name]["business_only_persist_columns"] = []
         config["etl"][name]["where_clause"] = ask_field(
             "where-clause", config["etl"][name]["where_clause"],
             "Optional SQL filter applied while reading this entity.",
@@ -2282,29 +2265,7 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         "Human-readable name shown on the KPI card.",
         "the application dashboard",
     )
-    aoi_card["unit_of_measurement"] = ask_field(
-        "KPI unit for area_of_interest",
-        aoi_card["unit_of_measurement"],
-        "Unit displayed beside the AOI count value (e.g. un.).",
-        "the application dashboard",
-    )
-    aoi_card["optional_label"] = ask_field(
-        "KPI optional label for area_of_interest",
-        aoi_card["optional_label"],
-        "Secondary unit shown for the area sum (e.g. ha).",
-        "the AREA_OF_INTEREST KPI card",
-    )
-    area = config["installation"]["area"]
-    area["unit"] = ask_field(
-        "Area unit code", area["unit"],
-        "Short code for the area measurement (e.g. ha, m²).",
-        "area labels and KPI subtotals",
-    )
-    area["unit_label"] = ask_field(
-        "Area unit label", area["unit_label"],
-        "Label shown beside area values in the UI.",
-        "detail screens and downloads",
-    )
+    aoi_card["unit_of_measurement"] = FIXED_AOI_COUNT_UNIT
     formats = config["installation"]["formats"]
     formats["date"] = ask_field(
         "Date format", formats["date"],
@@ -2386,6 +2347,8 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
 
     ask_about_page(config, example.parent.parent / "about")
 
+    ensure_fixed_aoi_area_column(config)
+    sync_aoi_area_unit_installation(config)
     write_adopter_config(active, config, template)
     print(f"\nConfiguration saved to {active}")
     return True
@@ -2606,6 +2569,8 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     template = yaml.safe_load(example.read_text(encoding="utf-8"))
     values = yaml.safe_load(active.read_text(encoding="utf-8"))
     validate_job_migration_path(root)
+    ensure_fixed_aoi_area_column(values)
+    sync_aoi_area_unit_installation(values)
     theme_count = get(values, "installation", "kpis", "theme_count", default=0)
     validate_theme_kpis(values)
     config_changed = reset_disabled_themes(values, template, theme_count)
@@ -2619,7 +2584,7 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
         if not isinstance(entity_values, dict):
             continue
         for key, value in entity_values.items():
-            if key in {"additional_columns", "business_only_persist_columns"}:
+            if key == "additional_columns":
                 continue
             source_values.append(value)
     invalid = [
@@ -2647,7 +2612,6 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
             )
     extra_layers = validate_extra_layers(values)
     additional_columns = aoi_additional_columns(values)
-    business_only_columns = aoi_business_only_persist_columns(values, theme_count)
     aoi_detail_fields = validate_aoi_detail_fields(values, additional_columns)
     if coerce_map_initial_view_to_planet(values):
         write_adopter_config(active, values, template)
@@ -2824,7 +2788,6 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     aoi.pop("comparison-columns", None)
     aoi.pop("column-mapping", None)
     aoi.pop("change-detection-strategy", None)
-    aoi.pop("business-only-persist-columns", None)
     aoi.pop("total-area-column", None)
     migration["kpis"] = build_migration_kpis(values)
     migration["batch"]["layers"] = build_batch_layers(extra_layers)
