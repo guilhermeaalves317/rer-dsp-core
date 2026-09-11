@@ -2494,12 +2494,12 @@ def wizard(example: Path, active: Path, *, edit: bool = False, root: Path | None
         if name == "area_of_interest":
             config["etl"][name]["area_column"] = FIXED_AOI_AREA_COLUMN
             aoi_section = config["etl"][name]
-            config["etl"][name]["additional_columns"] = ask_optional_column_list(
+            config["etl"][name]["additional_columns"] = ask_unblocked_column_list(
                 "Extra columns to migrate",
                 aoi_section.get("additional_columns") or [],
                 etl_field_help("additional_columns"),
                 "the ETL job mapping for this entity",
-                additional_blocked,
+                aoi_canonical_source_columns(aoi_section),
                 "etl.area_of_interest.additional_columns",
                 target_blocked=AOI_CANONICAL_TARGET_COLUMNS,
             )
@@ -3182,11 +3182,9 @@ def apply_config(root: Path, active: Path, *, quiet: bool = False) -> None:
     migration["execution-jobs"]["admin-unit-level-2-geoserver-job"] = True
     migration["execution-jobs"]["admin-unit-level-3-geoserver-job"] = True
     migration["execution-jobs"]["area-of-interest-geoserver-job"] = True
+    migration["execution-jobs"]["kpi-job"] = True
     layer_jobs_enabled = bool(extra_layers)
     migration["execution-jobs"]["layer-jobs"] = layer_jobs_enabled
-    migration["execution-jobs"]["kpi-job"] = bool(
-        jobs.get("kpi_job", jobs.get("area_of_interest", True))
-    )
     output = root / "config/Job-Data-Migration/application/application.yaml"
     output.write_text(dump_yaml(migration), encoding="utf-8")
 
